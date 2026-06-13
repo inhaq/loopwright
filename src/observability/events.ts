@@ -51,10 +51,16 @@ function num(v: unknown): number {
 export function normalizeUsage(usage: unknown): TokenUsage {
   if (usage === null || typeof usage !== "object") return { ...ZERO_USAGE };
   const u = usage as Record<string, unknown>;
-  const prompt = num(u["prompt_tokens"]) || num(u["input_tokens"]) || num(u["promptTokens"]);
-  const completion =
-    num(u["completion_tokens"]) || num(u["output_tokens"]) || num(u["completionTokens"]);
-  const totalRaw = num(u["total_tokens"]) || num(u["totalTokens"]);
+  // Prefer the first key that is actually PRESENT, not the first truthy one:
+  // `||` would discard a legitimate 0 (e.g. an empty prompt) in favor of a
+  // later alias, corrupting the usage ledger.
+  const pick = (...keys: string[]): number => {
+    for (const k of keys) if (k in u) return num(u[k]);
+    return 0;
+  };
+  const prompt = pick("prompt_tokens", "input_tokens", "promptTokens");
+  const completion = pick("completion_tokens", "output_tokens", "completionTokens");
+  const totalRaw = pick("total_tokens", "totalTokens");
   return {
     promptTokens: prompt,
     completionTokens: completion,
