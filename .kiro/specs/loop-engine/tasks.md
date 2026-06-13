@@ -50,9 +50,9 @@ Each task references the requirement(s) it satisfies.
 
 ## Milestone 4 — Parallel execution
 
-- [ ] 19. Dependency-graph scheduler honoring the parallelism limit _(Req 9)_
-- [ ] 20. Isolated workspaces (git worktrees) per concurrent task _(Req 9)_
-- [ ] 21. Integrator: merge completed work, run full verification, surface
+- [~] 19. Dependency-graph scheduler honoring the parallelism limit _(Req 9)_
+- [~] 20. Isolated workspaces (git worktrees) per concurrent task _(Req 9)_
+- [~] 21. Integrator: merge completed work, run full verification, surface
   conflicts _(Req 9)_
 
 ## Milestone 5 — Observability
