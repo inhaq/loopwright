@@ -188,6 +188,18 @@ export class CliRunner implements AgentRunner {
     const { command, promptVia, timeoutMs, maxCapturedChars } = this.opts;
     return new Promise((resolve) => {
       const started = Date.now();
+      // Already cancelled before we spawned: don't launch the subprocess at all.
+      if (req.signal?.aborted) {
+        resolve({
+          stdout: "",
+          stderr: "[cancelled]",
+          exitCode: 124,
+          timedOut: false,
+          durationMs: 0,
+          spawnError: "run cancelled",
+        });
+        return;
+      }
       const child = spawn(command, args, {
         cwd: req.cwd,
         env,
@@ -198,6 +210,7 @@ export class CliRunner implements AgentRunner {
       let stdout = "";
       let stderr = "";
       let timedOut = false;
+      let cancelled = false;
 
       child.stdout.on("data", (b: Buffer) => {
         stdout += b.toString();
@@ -213,8 +226,20 @@ export class CliRunner implements AgentRunner {
         killProcessTree(child);
       }, timeoutMs);
 
-      child.on("error", (err) => {
+      // External cancellation: kill the whole subprocess tree so a long model
+      // call stops promptly instead of waiting out the runner timeout.
+      const onAbort = (): void => {
+        cancelled = true;
+        killProcessTree(child);
+      };
+      req.signal?.addEventListener("abort", onAbort, { once: true });
+      const cleanup = (): void => {
         clearTimeout(timer);
+        req.signal?.removeEventListener("abort", onAbort);
+      };
+
+      child.on("error", (err) => {
+        cleanup();
         resolve({
           stdout,
           stderr,
@@ -225,11 +250,11 @@ export class CliRunner implements AgentRunner {
         });
       });
       child.on("close", (code) => {
-        clearTimeout(timer);
+        cleanup();
         resolve({
           stdout,
           stderr,
-          exitCode: timedOut ? 124 : (code ?? 1),
+          exitCode: timedOut || cancelled ? 124 : (code ?? 1),
           timedOut,
           durationMs: Date.now() - started,
         });

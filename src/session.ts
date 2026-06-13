@@ -141,6 +141,7 @@ export async function runGoal(
     const { actor, critic } = createRoles(config, {
       ...roleOpts,
       ...(onRunnerCall ? { onRunnerCall } : {}),
+      ...(signal ? { signal } : {}),
     });
 
     // Checkpoint to the store and (optionally) fan out to a caller-supplied
@@ -262,6 +263,7 @@ export async function runGoal(
         branches: greenBranches,
         ...(verifyCommands.length ? { verifyCommands } : {}),
         ...(executor ? { executor } : {}),
+        ...(signal ? { signal } : {}),
         ...(opts.log ? { log: opts.log } : {}),
       });
     }

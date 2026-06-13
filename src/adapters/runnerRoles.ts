@@ -64,12 +64,16 @@ export interface RunnerActorOptions {
   /** retry once with a corrective nudge when output won't parse (default true) */
   repairOnce?: boolean;
   log?: (line: string) => void;
+  /** cooperative cancellation, threaded into every runner call */
+  signal?: AbortSignal;
 }
 
 export interface RunnerCriticOptions {
   prompts?: CriticPromptTemplates;
   cwd?: string;
   log?: (line: string) => void;
+  /** cooperative cancellation, threaded into every runner call */
+  signal?: AbortSignal;
 }
 
 /** Actor role backed by an AgentRunner + prompt templates. */
@@ -79,6 +83,7 @@ export class RunnerActor implements Actor {
   private readonly cwd: string;
   private readonly repairOnce: boolean;
   private readonly log: ((line: string) => void) | undefined;
+  private readonly signal: AbortSignal | undefined;
 
   constructor(runner: AgentRunner, opts: RunnerActorOptions = {}) {
     this.runner = runner;
@@ -86,6 +91,7 @@ export class RunnerActor implements Actor {
     this.cwd = opts.cwd ?? ".";
     this.repairOnce = opts.repairOnce ?? true;
     this.log = opts.log;
+    this.signal = opts.signal;
   }
 
   async draftPlan(goal: string, feedback?: Finding[]): Promise<PlanDraftResult> {
@@ -120,6 +126,7 @@ export class RunnerActor implements Actor {
       prompt: this.prompts.selfReview(bundle),
       cwd: this.cwd,
       system: this.prompts.system,
+      ...(this.signal ? { signal: this.signal } : {}),
     });
     return { text: res.text, quotaExhausted: res.quotaExhausted };
   }
@@ -130,7 +137,12 @@ export class RunnerActor implements Actor {
     schema: S,
     what: string,
   ): Promise<z.output<S>> {
-    let res = await this.runner.run({ prompt, cwd: this.cwd, system: this.prompts.system });
+    let res = await this.runner.run({
+      prompt,
+      cwd: this.cwd,
+      system: this.prompts.system,
+      ...(this.signal ? { signal: this.signal } : {}),
+    });
     if (res.quotaExhausted) {
       throw new RunnerRoleError(`Actor ${what} failed: runner quota exhausted.`, {
         quotaExhausted: true,
@@ -144,6 +156,7 @@ export class RunnerActor implements Actor {
         prompt: `${prompt}\n\n${PARSE_REPAIR_NUDGE}`,
         cwd: this.cwd,
         system: this.prompts.system,
+        ...(this.signal ? { signal: this.signal } : {}),
       });
       if (res.quotaExhausted) {
         throw new RunnerRoleError(`Actor ${what} failed: runner quota exhausted.`, {
@@ -165,11 +178,13 @@ export class RunnerCritic implements Critic {
   private readonly runner: AgentRunner;
   private readonly prompts: CriticPromptTemplates;
   private readonly cwd: string;
+  private readonly signal: AbortSignal | undefined;
 
   constructor(runner: AgentRunner, opts: RunnerCriticOptions = {}) {
     this.runner = runner;
     this.prompts = opts.prompts ?? DEFAULT_CRITIC_PROMPTS;
     this.cwd = opts.cwd ?? ".";
+    this.signal = opts.signal;
   }
 
   /**
@@ -183,7 +198,12 @@ export class RunnerCritic implements Critic {
       req.kind === "plan"
         ? this.prompts.planReview(req.goal, req.plan, req.repairHint)
         : this.prompts.taskReview(req.bundle, req.repairHint);
-    const res = await this.runner.run({ prompt, cwd: this.cwd, system: this.prompts.system });
+    const res = await this.runner.run({
+      prompt,
+      cwd: this.cwd,
+      system: this.prompts.system,
+      ...(this.signal ? { signal: this.signal } : {}),
+    });
     return { text: res.text, quotaExhausted: res.quotaExhausted };
   }
 }

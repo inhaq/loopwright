@@ -158,6 +158,15 @@ export class HttpRunner implements AgentRunner {
     const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
     const started = Date.now();
 
+    // External cancellation: if the run is cancelled, abort the in-flight fetch
+    // immediately rather than waiting out the request timeout. If the signal has
+    // already fired, abort before we even dispatch.
+    const onAbort = (): void => controller.abort();
+    if (req.signal) {
+      if (req.signal.aborted) controller.abort();
+      else req.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
     try {
       const res = await this.fetchImpl(url, {
         method: "POST",
@@ -203,6 +212,9 @@ export class HttpRunner implements AgentRunner {
         },
       };
     } catch (err) {
+      // Distinguish an external cancellation from a timeout: both abort the same
+      // controller, so we check the caller's signal first.
+      const cancelled = req.signal?.aborted ?? false;
       const aborted = controller.signal.aborted;
       return {
         text: "",
@@ -211,12 +223,18 @@ export class HttpRunner implements AgentRunner {
           runnerId: this.profile.id,
           model: this.profile.model,
           durationMs: Date.now() - started,
-          timedOut: aborted,
-          error: aborted ? "request timed out" : String((err as Error).message ?? err),
+          timedOut: aborted && !cancelled,
+          cancelled,
+          error: cancelled
+            ? "request cancelled"
+            : aborted
+              ? "request timed out"
+              : String((err as Error).message ?? err),
         },
       };
     } finally {
       clearTimeout(timer);
+      req.signal?.removeEventListener("abort", onAbort);
     }
   }
 
