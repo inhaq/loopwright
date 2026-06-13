@@ -9,7 +9,7 @@
   --green: #3fb950;
   --yellow: #d29922;
   --red: #f85149;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --mono: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
 }
 
 * { box-sizing: border-box; }
@@ -94,6 +94,7 @@ button.small { font-size: 12px; padding: 3px 8px; }
 .actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
 .hint { color: var(--muted); font-size: 12px; }
 .hint.error, .error { color: var(--red); }
+.hint.pending { color: var(--yellow); }
 
 .goal { font-size: 15px; margin-bottom: 4px; }
 .session-id { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-bottom: 10px; }

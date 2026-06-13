@@ -73,7 +73,15 @@ impl EngineManager {
             .spawn()
             .map_err(|e| e.to_string())?;
 
-        let url = tauri::async_runtime::block_on(read_listening_url(&mut rx))?;
+        let url = match tauri::async_runtime::block_on(read_listening_url(&mut rx)) {
+            Ok(url) => url,
+            Err(e) => {
+                // Readiness failed (bad output or timeout): don't leak the
+                // spawned process — kill it before surfacing the error.
+                let _ = child.kill();
+                return Err(e);
+            }
+        };
 
         // Keep draining events so a full stdout/stderr pipe can't stall the
         // engine during a long run.
@@ -136,7 +144,10 @@ fn parse_listening(buf: &str) -> Option<String> {
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             if v.get("loopwright").and_then(|x| x.as_str()) == Some("listening") {
-                let host = v.get("host").and_then(|x| x.as_str()).unwrap_or("127.0.0.1");
+                let host = v
+                    .get("host")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("127.0.0.1");
                 let port = v.get("port").and_then(|x| x.as_u64())?;
                 return Some(format!("http://{host}:{port}"));
             }

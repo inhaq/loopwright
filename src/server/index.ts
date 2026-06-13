@@ -17,6 +17,7 @@
  * Tauri sidecar; also runnable directly (`npm run serve`) to use the UI from a
  * browser without any desktop toolchain.
  */
+import path from "node:path";
 import { loadConfig } from "../config.js";
 import { openStore } from "../storage/store.js";
 import { createServer } from "./server.js";
@@ -25,7 +26,10 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const store = await openStore(config.dbPath);
 
-  const staticDir = process.env.LOOPWRIGHT_STATIC_DIR;
+  // Resolve to an absolute path so the server's path-traversal guard works even
+  // when a relative LOOPWRIGHT_STATIC_DIR is supplied.
+  const staticEnv = process.env.LOOPWRIGHT_STATIC_DIR;
+  const staticDir = staticEnv ? path.resolve(staticEnv) : undefined;
   const server = createServer({
     store,
     config,

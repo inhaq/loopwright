@@ -143,6 +143,8 @@ describe("server: health + validation", () => {
   it("404s unknown api routes and missing traces", async () => {
     expect((await fetch(`${base}/api/nope`)).status).toBe(404);
     expect((await fetch(`${base}/api/sessions/ghost/trace`)).status).toBe(404);
+    // Streaming a session that was never started must not implicitly create it.
+    expect((await fetch(`${base}/api/runs/ghost/stream`)).status).toBe(404);
   });
 });
 
@@ -169,6 +171,7 @@ describe("server: run lifecycle + trace", () => {
       }
       await new Promise((r) => setTimeout(r, 10));
     }
+    expect(trace, "trace did not reach completed state within polling window").toBeDefined();
     expect(trace.trace.session.goal).toBe("ship it");
     expect(trace.trace.session.status).toBe("completed");
     expect(trace.trace.tasks.map((t: any) => t.taskId)).toContain("task-1");
@@ -249,6 +252,7 @@ describe("server: live SSE stream", () => {
     // Let the run finish so the whole buffer exists.
     const first = await fetch(`${base}/api/runs/${sessionId}/stream`);
     const all = await readSse(first, (m) => m.some((x) => x.event === "status" && x.data.phase === "done"));
+    expect(all.length).toBeGreaterThan(1);
     const cutoff = all[1]!.id;
 
     const resumed = await fetch(`${base}/api/runs/${sessionId}/stream`, {
@@ -256,6 +260,9 @@ describe("server: live SSE stream", () => {
     });
     const rest = await readSse(resumed, (m) => m.some((x) => x.event === "status" && x.data.phase === "done"));
     expect(rest.every((m) => m.id > cutoff)).toBe(true);
-    expect(rest.length).toBe(all.length - (cutoff + 1));
+    // Derive the expected replay count by comparison rather than assuming a
+    // zero-based, gapless id scheme.
+    const expected = all.filter((m) => m.id > cutoff).length;
+    expect(rest.length).toBe(expected);
   });
 });

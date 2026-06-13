@@ -93,9 +93,15 @@ export class RunHub {
    * returned unsubscribe function is called. `afterId` of -1 (the default)
    * replays the whole history, matching a fresh client; a reconnecting client
    * passes its last seen id so it does not re-process what it already has.
+   *
+   * Subscribing to an unknown session does NOT create a channel — that would
+   * let a stray monitor connection reserve a session id and make a later
+   * `POST /api/runs` for it spuriously report "already running". Callers should
+   * gate on {@link has} first; for safety this returns a no-op unsubscribe.
    */
   subscribe(sessionId: string, listener: Listener, afterId = -1): () => void {
-    const ch = this.channel(sessionId);
+    const ch = this.channels.get(sessionId);
+    if (!ch) return () => {};
     for (const msg of ch.buffer) {
       if (msg.id > afterId) listener(msg);
     }

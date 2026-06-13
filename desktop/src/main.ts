@@ -37,6 +37,9 @@ function badge(state: string): HTMLElement {
   return h("span", { class: `badge state-${state}` }, [state]);
 }
 
+/** Valid POSIX-ish environment variable name (used for secret keys). */
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 // --- navigation -------------------------------------------------------------
 
 type Nav = "start" | "sessions" | "secrets";
@@ -236,11 +239,15 @@ function renderMonitor(sessionId: string, goal: string): void {
     }
   }
 
-  void openStream(sessionId, onMessage, () => {
+  const closePromise = openStream(sessionId, onMessage, () => {
     /* EventSource auto-reconnects with Last-Event-ID; nothing to do here */
-  }).then((close) => {
-    teardown = close;
   });
+  // Register teardown synchronously: if the user navigates away before
+  // openStream resolves, this still closes the EventSource once it exists,
+  // preventing a leaked connection that dispatches into a stale view.
+  teardown = () => {
+    void closePromise.then((close) => close());
+  };
 }
 
 // --- Results view -----------------------------------------------------------
@@ -370,6 +377,18 @@ async function renderSecrets(): Promise<void> {
   const listEl = h("ul", { class: "secret-list" });
   card.append(listEl);
 
+  // Stored secrets are injected into the engine only at (re)start, so changing
+  // them requires a restart to take effect. Make that gate explicit rather than
+  // silently leaving the running engine on stale values.
+  const pending = h("div", { class: "hint pending", hidden: "true" }, [
+    "Stored secrets changed — restart the engine to apply.",
+  ]);
+  const markPending = (): void => {
+    pending.hidden = false;
+  };
+
+  const formError = h("div", { class: "error", hidden: "true" });
+
   async function refresh(): Promise<void> {
     listEl.innerHTML = "";
     const keys = await listSecretKeys();
@@ -379,6 +398,7 @@ async function renderSecrets(): Promise<void> {
       del.addEventListener("click", async () => {
         await deleteSecret(k);
         await refresh();
+        markPending();
       });
       listEl.append(h("li", {}, [h("code", {}, [k]), del]));
     }
@@ -392,21 +412,47 @@ async function renderSecrets(): Promise<void> {
   `;
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
+    formError.hidden = true;
     const data = new FormData(form);
-    await setSecret(String(data.get("key")), String(data.get("value")));
+    const key = String(data.get("key") ?? "").trim();
+    // The key becomes an env var injected into the engine; reject invalid names
+    // (and the reserved LOOPWRIGHT_ prefix) before persisting.
+    if (!ENV_KEY_RE.test(key) || key.startsWith("LOOPWRIGHT_")) {
+      formError.textContent =
+        "Key must be a valid env var name and must not start with LOOPWRIGHT_ (e.g. OPENAI_API_KEY).";
+      formError.hidden = false;
+      return;
+    }
+    try {
+      await setSecret(key, String(data.get("value") ?? ""));
+    } catch (err) {
+      formError.textContent = `Failed to save: ${(err as Error).message}`;
+      formError.hidden = false;
+      return;
+    }
     form.reset();
     await refresh();
+    markPending();
   });
-  card.append(form);
+  card.append(form, formError);
 
   const restart = h("button", {}, ["Restart engine to apply secret changes"]);
   restart.addEventListener("click", async () => {
     restart.textContent = "Restarting…";
-    await restartEngine();
-    restart.textContent = "Restart engine to apply secret changes";
-    await checkEngine();
+    restart.setAttribute("disabled", "true");
+    try {
+      await restartEngine();
+      pending.hidden = true;
+      await checkEngine();
+    } catch (err) {
+      formError.textContent = `Restart failed: ${(err as Error).message}`;
+      formError.hidden = false;
+    } finally {
+      restart.textContent = "Restart engine to apply secret changes";
+      restart.removeAttribute("disabled");
+    }
   });
-  card.append(h("div", { class: "actions" }, [restart]));
+  card.append(h("div", { class: "actions" }, [restart, pending]));
 
   await refresh();
 }

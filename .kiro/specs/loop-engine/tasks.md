@@ -82,7 +82,7 @@ Each task references the requirement(s) it satisfies.
 Milestones 1–5 are complete and merged on `main` (engine core, runners +
 role bindings, persistence/resume, the parallel scheduler with git-worktree
 isolation and the integrator, and the observability/usage/trace layer); the
-suite is green (125 tests, `tsc --noEmit` clean).
+suite is green (132 tests, `tsc --noEmit` clean).
 
 Active work is **Milestone 6 — Desktop delivery**. Rather than reimplement loop
 logic (forbidden by Req 13), the desktop app reuses the headless engine through

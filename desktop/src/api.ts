@@ -26,11 +26,9 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
 export async function apiBase(): Promise<string> {
   if (cachedBase !== undefined) return cachedBase;
   if (isTauri()) {
-    try {
-      cachedBase = await tauriInvoke<string>("engine_url");
-    } catch {
-      cachedBase = "http://127.0.0.1:4317"; // fallback to a conventional port
-    }
+    // Fail fast: surfacing the real startup/invoke error is far safer than
+    // silently routing API + secret traffic to an arbitrary local port.
+    cachedBase = await tauriInvoke<string>("engine_url");
   } else {
     cachedBase = "";
   }

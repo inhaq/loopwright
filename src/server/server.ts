@@ -237,6 +237,13 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   }
 
   function streamRun(req: IncomingMessage, res: ServerResponse, sessionId: string): void {
+    // Unknown session: don't let an SSE connection implicitly create a channel
+    // (which would reserve the id). Report 404 so the client can fall back to
+    // the trace endpoint for a past run.
+    if (!hub.has(sessionId)) {
+      return send(res, 404, { error: `no active run for session "${sessionId}"` });
+    }
+
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache, no-transform",
@@ -275,13 +282,17 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   }
 
   async function serveStatic(res: ServerResponse, pathname: string, dir: string): Promise<void> {
+    // Normalize the asset root to an absolute path so the traversal guard below
+    // compares like with like even when `dir` came in relative (e.g. a relative
+    // LOOPWRIGHT_STATIC_DIR), which would otherwise reject every request.
+    const root = path.resolve(dir);
     const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
-    const resolved = path.resolve(dir, rel);
+    const resolved = path.resolve(root, rel);
     // Path-traversal guard: never serve outside the asset directory.
-    if (resolved !== dir && !resolved.startsWith(dir + path.sep)) {
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
       return send(res, 403, { error: "forbidden" });
     }
-    const file = await resolveFile(resolved, dir);
+    const file = await resolveFile(resolved, root);
     if (!file) return send(res, 404, { error: "not found" });
     const ext = path.extname(file).toLowerCase();
     res.writeHead(200, {
