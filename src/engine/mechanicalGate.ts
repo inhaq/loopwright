@@ -4,6 +4,7 @@ import {
   type MechanicalStepResult,
 } from "../schemas/artifact.js";
 import { redactAndTruncate } from "./redaction.js";
+import { killProcessTree, detachForTreeKill } from "./processTree.js";
 
 /**
  * Runs a task's verify commands (build/test/lint) as the cheap, deterministic
@@ -58,7 +59,10 @@ export function createShellExecutor(
         resolve({ exitCode: TIMEOUT_EXIT_CODE, output: "[cancelled]", durationMs: 0 });
         return;
       }
-      const child = spawn(command, { cwd, shell: true });
+      // Spawn detached on POSIX so the timeout/cancellation handlers can kill
+      // the entire process group, not just the immediate shell. See
+      // killProcessTree / detachForTreeKill.
+      const child = spawn(command, { cwd, shell: true, detached: detachForTreeKill });
       let output = "";
       let timedOut = false;
       let cancelled = false;
@@ -70,14 +74,15 @@ export function createShellExecutor(
 
       const timer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGKILL");
+        killProcessTree(child);
       }, timeoutMs);
 
-      // Cancellation: kill the child so a long verify/build command stops
+      // Cancellation: kill the whole process tree so a long verify/build
+      // command (and any descendants it spawned, e.g. `npm test`) stops
       // promptly when the run is cancelled.
       const onAbort = (): void => {
         cancelled = true;
-        child.kill("SIGKILL");
+        killProcessTree(child);
       };
       signal?.addEventListener("abort", onAbort, { once: true });
       const cleanup = (): void => {
