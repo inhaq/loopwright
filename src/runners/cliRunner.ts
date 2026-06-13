@@ -73,14 +73,17 @@ export type CliRunnerOptions = z.infer<typeof CliRunnerOptionsSchema>;
 const TEMPLATE_RE = /\{\{(prompt|model|system|cwd)\}\}/g;
 const ENV_REF_RE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
+/** Replaces {{prompt}}/{{model}}/{{system}}/{{cwd}} placeholders in a string. */
 function fillTemplate(s: string, vars: PlaceholderVars): string {
   return s.replace(TEMPLATE_RE, (_m, key: keyof PlaceholderVars) => vars[key] ?? "");
 }
 
+/** Expands ${VAR} references in a value from the given environment source. */
 function expandEnvRefs(value: string, source: NodeJS.ProcessEnv): string {
   return value.replace(ENV_REF_RE, (_m, name: string) => source[name] ?? "");
 }
 
+/** Reads a dotted path (e.g. "message.content") from a nested object, safely. */
 function getByPath(obj: unknown, dotted: string): unknown {
   return dotted.split(".").reduce<unknown>((acc, key) => {
     if (acc !== null && typeof acc === "object" && key in (acc as Record<string, unknown>)) {
@@ -111,6 +114,7 @@ function parseJsonStream(stdout: string, opts: CliRunnerOptions["output"]): stri
   return last;
 }
 
+/** A captured subprocess result, before output-mode extraction. */
 interface SpawnCapture {
   stdout: string;
   stderr: string;
@@ -120,16 +124,19 @@ interface SpawnCapture {
   spawnError?: string;
 }
 
+/** Drives a headless command-line agent as a subprocess per its RunnerProfile. */
 export class CliRunner implements AgentRunner {
   readonly profile: RunnerProfile;
   private readonly opts: CliRunnerOptions;
 
+  /** Validates the profile's options eagerly so a bad profile fails fast. */
   constructor(profile: RunnerProfile) {
     this.profile = profile;
     // Validate eagerly so a bad profile fails at construction, not mid-run.
     this.opts = CliRunnerOptionsSchema.parse(profile.options ?? {});
   }
 
+  /** Runs the configured command for one request and returns the parsed result. */
   async run(req: RunRequest): Promise<RunResult> {
     const vars: PlaceholderVars = {
       prompt: req.prompt,
@@ -171,6 +178,7 @@ export class CliRunner implements AgentRunner {
     };
   }
 
+  /** Spawns the command (no shell) with timeout + bounded per-stream capture. */
   private spawnCapture(
     args: string[],
     req: RunRequest,
@@ -227,6 +235,7 @@ export class CliRunner implements AgentRunner {
     });
   }
 
+  /** Extracts the answer text from captured stdout per the configured mode. */
   private async extractText(
     stdout: string,
     vars: PlaceholderVars,
