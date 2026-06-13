@@ -30,33 +30,76 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct EngineManager {
     app: AppHandle,
-    url: Mutex<Option<String>>,
-    token: Mutex<Option<String>>,
-    child: Mutex<Option<CommandChild>>,
+    /// All mutable sidecar state lives behind one lock so the lifecycle calls
+    /// (start / restart / shutdown) are serialized end-to-end. Guarding url,
+    /// token, and the child handle separately let a concurrent `restart_engine`
+    /// — or a restart racing app exit — interleave: spawning a second sidecar,
+    /// overwriting the stored child handle, or clearing the URL/token of a
+    /// freshly-started process. A single mutex held across each operation makes
+    /// them mutually exclusive.
+    lifecycle: Mutex<Lifecycle>,
+}
+
+/// The mutable engine state, guarded as one unit by `EngineManager::lifecycle`.
+struct Lifecycle {
+    /// The engine base URL once started (e.g. "http://127.0.0.1:53187").
+    url: Option<String>,
+    /// The per-process bearer token the engine requires on its API.
+    token: Option<String>,
+    /// Handle to the spawned sidecar, used to force-kill as a last resort.
+    child: Option<CommandChild>,
 }
 
 impl EngineManager {
     pub fn new(app: AppHandle) -> Self {
         Self {
             app,
-            url: Mutex::new(None),
-            token: Mutex::new(None),
-            child: Mutex::new(None),
+            lifecycle: Mutex::new(Lifecycle {
+                url: None,
+                token: None,
+                child: None,
+            }),
         }
     }
 
     /// The engine base URL once started (e.g. "http://127.0.0.1:53187").
     pub fn url(&self) -> Option<String> {
-        self.url.lock().unwrap().clone()
+        self.lifecycle.lock().unwrap().url.clone()
     }
 
     /// The per-process bearer token the engine requires on its API.
     pub fn token(&self) -> Option<String> {
-        self.token.lock().unwrap().clone()
+        self.lifecycle.lock().unwrap().token.clone()
     }
 
     /// Spawns the sidecar and blocks until it reports its listening port.
+    /// Holds the lifecycle lock for the whole operation so it cannot race
+    /// another start/restart/shutdown.
     pub fn start(&self) -> Result<String, String> {
+        let mut state = self.lifecycle.lock().unwrap();
+        self.start_locked(&mut state)
+    }
+
+    /// Kills the running sidecar (if any) and starts a fresh one. Used after
+    /// secrets change so the new values are picked up. The shutdown and the
+    /// subsequent start run under a single held lock, so a second restart (or
+    /// app exit) can't slip in between and spawn an extra sidecar.
+    pub fn restart(&self) -> Result<String, String> {
+        let mut state = self.lifecycle.lock().unwrap();
+        self.shutdown_locked(&mut state);
+        self.start_locked(&mut state)
+    }
+
+    /// Stops the running sidecar gracefully (see `shutdown_locked`). Holds the
+    /// lifecycle lock so it serializes with any in-flight start/restart.
+    pub fn shutdown(&self) {
+        let mut state = self.lifecycle.lock().unwrap();
+        self.shutdown_locked(&mut state);
+    }
+
+    /// Spawns the sidecar and records its URL/token/child into `state`. The
+    /// caller must hold the lifecycle lock.
+    fn start_locked(&self, state: &mut Lifecycle) -> Result<String, String> {
         let data_dir = self.app.path().app_data_dir().map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
         let db_path = data_dir.join("sessions.json");
@@ -96,27 +139,21 @@ impl EngineManager {
         // engine during a long run.
         tauri::async_runtime::spawn(async move { while rx.recv().await.is_some() {} });
 
-        *self.url.lock().unwrap() = Some(ready.url.clone());
-        *self.token.lock().unwrap() = ready.token;
-        *self.child.lock().unwrap() = Some(child);
+        state.url = Some(ready.url.clone());
+        state.token = ready.token;
+        state.child = Some(child);
         Ok(ready.url)
-    }
-
-    /// Kills the running sidecar (if any) and starts a fresh one. Used after
-    /// secrets change so the new values are picked up.
-    pub fn restart(&self) -> Result<String, String> {
-        self.shutdown();
-        self.start()
     }
 
     /// Stops the running sidecar gracefully: asks the engine to shut itself
     /// down over HTTP first — so it can cancel in-flight runs and kill their
     /// detached subprocess trees — and only then force-kills as a fallback.
-    /// A direct `child.kill()` would orphan those detached descendants.
-    pub fn shutdown(&self) {
-        let child = self.child.lock().unwrap().take();
-        let url = self.url.lock().unwrap().clone();
-        let token = self.token.lock().unwrap().clone();
+    /// A direct `child.kill()` would orphan those detached descendants. The
+    /// caller must hold the lifecycle lock.
+    fn shutdown_locked(&self, state: &mut Lifecycle) {
+        let child = state.child.take();
+        let url = state.url.clone();
+        let token = state.token.clone();
 
         if let Some(url) = url.as_deref() {
             request_shutdown(url, token.as_deref());
@@ -131,8 +168,8 @@ impl EngineManager {
             let _ = child.kill();
         }
 
-        *self.url.lock().unwrap() = None;
-        *self.token.lock().unwrap() = None;
+        state.url = None;
+        state.token = None;
     }
 }
 

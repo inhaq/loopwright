@@ -23,10 +23,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Quality gate: must pass before any artifact is built or published.
+  # Quality gate: must pass before any artifact is built or published. Runs on
+  # every release platform so a direct tag push exercises the JS + Rust test
+  # suites on macOS/Windows too, not just Linux. One-time, platform-independent
+  # checks (tag/version match, dependency audits) run on Linux only.
   gate:
-    name: gate
-    runs-on: ubuntu-latest
+    name: gate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,9 +44,11 @@ jobs:
           node-version: 22
 
       # Fail fast (before the expensive toolchain/build steps) if a tag does not
-      # match the versions committed to every manifest.
+      # match the versions committed to every manifest. Platform-independent, so
+      # run it once on Linux.
       - name: Verify tag matches manifest versions
-        if: github.ref_type == 'tag'
+        if: matrix.os == 'ubuntu-latest' && github.ref_type == 'tag'
+        shell: bash
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
@@ -79,6 +88,7 @@ jobs:
           workspaces: desktop/src-tauri -> target
 
       - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -107,10 +117,13 @@ jobs:
       - name: Test
         run: npm test
 
+      # Dependency audits are platform-independent; run them once on Linux.
       - name: Audit root dependencies
+        if: matrix.os == 'ubuntu-latest'
         run: npm audit --audit-level=moderate
 
       - name: Audit desktop dependencies
+        if: matrix.os == 'ubuntu-latest'
         run: npm audit --audit-level=high
         working-directory: desktop
 
@@ -214,7 +227,11 @@ jobs:
           releaseName: Loopwright ${{ github.ref_type == 'tag' && github.ref_name || format('dev build {0}', github.run_number) }}
           # Publish as a draft so a human reviews artifacts before release.
           releaseDraft: true
-          prerelease: false
+          # Manual (workflow_dispatch) builds produce a throwaway dev tag, so
+          # mark them prerelease — otherwise publishing the draft would let
+          # GitHub treat a dev build as a normal release. Real version tags stay
+          # non-prerelease.
+          prerelease: ${{ github.ref_type != 'tag' }}
           args: ${{ matrix.args }}
 
 # Production distribution checklist (requires team-owned credentials/decisions):
