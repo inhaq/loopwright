@@ -77,6 +77,17 @@ export interface CreateServerOptions {
   retainMs?: number;
   /** most recent messages retained per run for SSE replay */
   maxBufferPerRun?: number;
+  /**
+   * Invoked once a graceful shutdown (via stop() or POST /api/shutdown) has
+   * finished tearing the server down — e.g. the entrypoint passes
+   * `() => process.exit(0)`.
+   */
+  onShutdown?: () => void;
+  /**
+   * How long (ms) stop() waits for in-flight connections to drain before
+   * force-closing any that remain (idle keep-alive sockets, slow clients).
+   */
+  shutdownGraceMs?: number;
 }
 
 export interface LoopwrightServer {
@@ -103,6 +114,20 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 /** True for hosts that only accept connections from the local machine. */
 export function isLoopbackHost(host: string): boolean {
   return LOOPBACK_HOSTS.has(host.trim().toLowerCase());
+}
+
+/**
+ * Caller-supplied session ids flow into git branch names and worktree
+ * directory paths (see workspace/worktrees.ts), so they must be a bounded,
+ * filesystem- and ref-safe token. We accept letters, digits, `_` and `-` only
+ * (which covers the UUIDs we mint for new runs) and forbid `.`/`/` so a value
+ * like `../../etc` or `..` can never escape the worktree root or forge a ref.
+ */
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** Whether a caller-supplied session id is safe to use in paths/refs. */
+export function isValidSessionId(id: string): boolean {
+  return SESSION_ID_RE.test(id);
 }
 
 /** Loopback and the Tauri webview are the only origins ever granted CORS. */
@@ -167,10 +192,16 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   const token = opts.token ?? randomUUID();
   const maxActiveRuns = opts.maxActiveRuns ?? 4;
   const retainMs = opts.retainMs ?? 5 * 60_000;
+  const onShutdown = opts.onShutdown;
+  const shutdownGraceMs = opts.shutdownGraceMs ?? 3_000;
   const hub = new RunHub(opts.maxBufferPerRun);
   let activeRuns = 0;
   /** abort controllers for in-flight runs, keyed by session id (for cancel) */
   const controllers = new Map<string, AbortController>();
+  /** open SSE responses, so a graceful shutdown can end them deterministically */
+  const sseClients = new Set<ServerResponse>();
+  /** memoized graceful-shutdown promise so stop() is safe to call repeatedly */
+  let closing: Promise<void> | undefined;
 
   /**
    * Constant-time bearer-token check. The token is read from the Authorization
@@ -242,6 +273,19 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       return send(res, 202, { cancelling: true }, cors);
     }
 
+    // Graceful shutdown: the desktop shell calls this before killing the
+    // sidecar so in-flight runs are cancelled (which kills their detached
+    // subprocess trees) and SSE clients are closed cleanly, rather than being
+    // hard-killed and orphaning work. Token-protected like the rest of /api.
+    if (pathname === "/api/shutdown" && method === "POST") {
+      send(res, 202, { shuttingDown: true }, cors);
+      // Defer so the 202 flushes before the server tears itself down.
+      setImmediate(() => {
+        void closeServer().then(() => onShutdown?.());
+      });
+      return;
+    }
+
     if (pathname === "/api/sessions" && method === "GET") {
       const sessions = await store.listSessions();
       sessions.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
@@ -290,6 +334,17 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     }
     runConfig.dbPath = config.dbPath;
 
+    // A caller-supplied session id becomes part of git branch names and
+    // worktree paths, so reject anything outside the bounded safe format before
+    // it reaches the filesystem/git. New runs without an id get a safe UUID.
+    if (body.sessionId !== undefined && !isValidSessionId(body.sessionId)) {
+      return send(
+        res,
+        400,
+        { error: "sessionId must match /^[A-Za-z0-9_-]{1,64}$/" },
+        cors,
+      );
+    }
     const sessionId = body.sessionId ?? randomUUID();
     if (hub.has(sessionId) && hub.phase(sessionId) === "running") {
       return send(res, 409, { error: `session ${sessionId} is already running` }, cors);
@@ -400,6 +455,10 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       Number.isFinite(afterId) ? afterId : -1,
     );
 
+    // Track this stream so a graceful shutdown can end it; otherwise the
+    // long-lived keep-alive connection would block http.close() indefinitely.
+    sseClients.add(res);
+
     // Heartbeat keeps intermediaries from closing an idle stream during long
     // model calls.
     const heartbeat = setInterval(() => res.write(": ping\n\n"), 15_000);
@@ -407,6 +466,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     const close = (): void => {
       clearInterval(heartbeat);
       unsubscribe();
+      sseClients.delete(res);
     };
     req.on("close", close);
     res.on("close", close);
@@ -469,6 +529,51 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     return undefined;
   }
 
+  /**
+   * Graceful teardown: stop in-flight work and close connections so the
+   * process can exit promptly without orphaning runs.
+   *   1. Abort every active run. The cooperative cancel handlers (HttpRunner,
+   *      CliRunner, the mechanical gate) fire synchronously and kill detached
+   *      subprocess trees, so no shell/build descendants are left running.
+   *   2. End open SSE streams — these are long-lived and would otherwise keep
+   *      http.close() from ever completing.
+   *   3. Stop accepting new connections and wait for drain, then force-close
+   *      anything still lingering after the grace period.
+   * Memoized so concurrent stop()/shutdown callers share one teardown.
+   */
+  function closeServer(): Promise<void> {
+    if (closing) return closing;
+    closing = (async () => {
+      for (const controller of controllers.values()) controller.abort();
+      for (const res of sseClients) {
+        try {
+          res.end();
+        } catch {
+          /* already closed */
+        }
+      }
+      sseClients.clear();
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = (): void => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        http.close(() => finish());
+        const timer = setTimeout(() => {
+          // Drop any sockets still open (idle keep-alive, slow clients) so the
+          // close callback can fire and we don't hang on shutdown.
+          http.closeAllConnections?.();
+          finish();
+        }, shutdownGraceMs);
+        if (typeof timer.unref === "function") timer.unref();
+      });
+    })();
+    return closing;
+  }
+
   return {
     http,
     hub,
@@ -485,7 +590,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       });
     },
     stop(): Promise<void> {
-      return new Promise<void>((resolve) => http.close(() => resolve()));
+      return closeServer();
     },
   };
 }

@@ -48,7 +48,7 @@ fn list_secret_keys(app: tauri::AppHandle) -> Result<Vec<String>, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             // Start the engine sidecar up front so the UI has an endpoint as
@@ -69,6 +69,17 @@ pub fn run() {
             delete_secret,
             list_secret_keys
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+
+    // Gracefully stop the engine sidecar when the app is exiting so it can
+    // cancel in-flight runs and kill their detached subprocess trees, instead
+    // of being orphaned by an abrupt process teardown.
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+            if let Some(manager) = app_handle.try_state::<EngineManager>() {
+                manager.shutdown();
+            }
+        }
+    });
 }

@@ -53,9 +53,13 @@ export class GitWorktreeManager {
 
   constructor(opts: WorktreeManagerOptions) {
     this.repoDir = opts.repoDir;
-    this.sessionId = opts.sessionId;
+    // Defense in depth: the session id becomes part of branch names and the
+    // worktree root path, so slug it here too (the server already restricts it
+    // to a safe format) — a stray `/` or `..` must never escape the root or
+    // forge a ref even if a caller bypasses the HTTP boundary.
+    this.sessionId = slug(opts.sessionId);
     this.baseRef = opts.baseRef ?? "HEAD";
-    this.root = opts.root ?? path.join(opts.repoDir, ".loopwright", "worktrees", opts.sessionId);
+    this.root = opts.root ?? path.join(opts.repoDir, ".loopwright", "worktrees", this.sessionId);
     this.branchPrefix = opts.branchPrefix ?? "loopwright";
     this.exec = opts.git ?? spawnGit;
   }

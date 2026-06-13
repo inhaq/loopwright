@@ -53,6 +53,8 @@ async function main(): Promise<void> {
     store,
     config,
     token,
+    // When a graceful shutdown finishes (signal or POST /api/shutdown), exit.
+    onShutdown: () => process.exit(0),
     ...(staticDir ? { staticDir } : {}),
   });
 
@@ -76,7 +78,13 @@ async function main(): Promise<void> {
   // Single-line, parseable readiness signal for the supervising process.
   console.log(JSON.stringify({ loopwright: "listening", host, port: bound, token }));
 
+  // Graceful shutdown on signals: stop() aborts in-flight runs (killing their
+  // detached subprocess trees) and closes SSE streams before the process exits,
+  // so a SIGTERM/SIGINT can't orphan active work or hang on open streams.
+  let stopping = false;
   const shutdown = (): void => {
+    if (stopping) return;
+    stopping = true;
     void server.stop().then(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);

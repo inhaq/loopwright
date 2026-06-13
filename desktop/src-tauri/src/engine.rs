@@ -9,6 +9,8 @@
 //! secret crossing into the webview or onto disk in plaintext.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -103,13 +105,69 @@ impl EngineManager {
     /// Kills the running sidecar (if any) and starts a fresh one. Used after
     /// secrets change so the new values are picked up.
     pub fn restart(&self) -> Result<String, String> {
-        if let Some(child) = self.child.lock().unwrap().take() {
-            let _ = child.kill();
-        }
-        *self.url.lock().unwrap() = None;
-        *self.token.lock().unwrap() = None;
+        self.shutdown();
         self.start()
     }
+
+    /// Stops the running sidecar gracefully: asks the engine to shut itself
+    /// down over HTTP first — so it can cancel in-flight runs and kill their
+    /// detached subprocess trees — and only then force-kills as a fallback.
+    /// A direct `child.kill()` would orphan those detached descendants.
+    pub fn shutdown(&self) {
+        let child = self.child.lock().unwrap().take();
+        let url = self.url.lock().unwrap().clone();
+        let token = self.token.lock().unwrap().clone();
+
+        if let Some(url) = url.as_deref() {
+            request_shutdown(url, token.as_deref());
+        }
+        // Give the engine a brief moment to act on the request and exit on its
+        // own before we force-kill.
+        if child.is_some() {
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        if let Some(child) = child {
+            // Best-effort fallback: a no-op if the engine already exited.
+            let _ = child.kill();
+        }
+
+        *self.url.lock().unwrap() = None;
+        *self.token.lock().unwrap() = None;
+    }
+}
+
+/// Sends a best-effort `POST /api/shutdown` to the engine over loopback so it
+/// can tear itself down gracefully. Uses a raw, short-lived TCP request to
+/// avoid pulling in an HTTP client dependency for a single local call; all
+/// errors are ignored because `shutdown()` force-kills as a fallback.
+fn request_shutdown(url: &str, token: Option<&str>) {
+    // url looks like "http://127.0.0.1:53187"; reduce it to "host:port".
+    let authority = match url.strip_prefix("http://") {
+        Some(rest) => rest.split('/').next().unwrap_or(rest),
+        None => return,
+    };
+
+    let mut stream = match TcpStream::connect(authority) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+
+    let auth_line = match token {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
+    let req = format!(
+        "POST /api/shutdown HTTP/1.1\r\nHost: {authority}\r\n{auth_line}\
+Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let _ = stream.write_all(req.as_bytes());
+    let _ = stream.flush();
+    // Read (and discard) the response so we wait for the server to acknowledge
+    // before returning; the connection closing also signals it has begun.
+    let mut buf = [0u8; 256];
+    let _ = stream.read(&mut buf);
 }
 
 /// The engine's startup handshake: where to reach it and the token to use.
