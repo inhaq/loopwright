@@ -35,9 +35,9 @@ Each task references the requirement(s) it satisfies.
   - [~] 13.1 Actor prompts: draft plan, build task, fix from feedback
   - [~] 13.2 Critic prompts: plan review and task review producing rubric JSON
   - [~] 13.3 Wire role bindings through configuration
-- [ ] 14. `HttpRunner` for OpenAI-compatible endpoints (base URL + key + model)
+- [~] 14. `HttpRunner` for OpenAI-compatible endpoints (base URL + key + model)
   behind the same interface _(Req 8)_
-- [ ] 15. End-to-end run against real runners on a sample goal _(Req 1, 2)_
+- [~] 15. End-to-end run against real runners on a sample goal _(Req 1, 2)_
 
 ## Milestone 3 — Persistence and resilience
 
