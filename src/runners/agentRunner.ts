@@ -15,7 +15,23 @@
  * new transport is a new runner class. The engine never changes.
  */
 
+import { z } from "zod";
+
 export type RunnerKind = "cli" | "http" | "mock";
+
+/**
+ * Validates a runner profile loaded from configuration. The {@link RunnerProfile}
+ * interface below remains the canonical type used throughout the engine; this
+ * schema exists so config-supplied profiles fail fast with a clear message.
+ */
+export const RunnerProfileSchema = z
+  .object({
+    id: z.string().min(1),
+    kind: z.enum(["cli", "http", "mock"]),
+    model: z.string().default(""),
+    options: z.record(z.unknown()).optional(),
+  })
+  .strict();
 
 export interface RunnerProfile {
   /** stable id referenced by role bindings, e.g. "primary", "reviewer" */
