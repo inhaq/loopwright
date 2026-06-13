@@ -141,6 +141,19 @@ async function readSse(
   return msgs;
 }
 
+/** Polls `pred` until it returns truthy, or the timeout elapses. */
+async function waitFor(
+  pred: () => boolean | Promise<boolean>,
+  timeoutMs = 3000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await pred()) return true;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return false;
+}
+
 describe("server: health + validation", () => {
   beforeEach(() => startServer());
 
@@ -412,5 +425,80 @@ describe("server: live SSE stream", () => {
     // zero-based, gapless id scheme.
     const expected = all.filter((m) => m.id > cutoff).length;
     expect(rest.length).toBe(expected);
+  });
+});
+
+describe("server: graceful shutdown", () => {
+  it("POST /api/shutdown returns 202, tears down, and invokes onShutdown", async () => {
+    let shutdownCalled = false;
+    server = createServer({
+      store: new MemoryStore(),
+      config: baseConfig,
+      baseEnv: {},
+      token: TOKEN,
+      shutdownGraceMs: 500,
+      onShutdown: () => {
+        shutdownCalled = true;
+      },
+    });
+    base = `http://127.0.0.1:${await server.start(0)}`;
+
+    const res = await fetch(`${base}/api/shutdown`, { method: "POST", headers: auth() });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ shuttingDown: true });
+
+    // onShutdown fires only after the graceful teardown completes.
+    expect(await waitFor(() => shutdownCalled)).toBe(true);
+  });
+
+  it("stop() aborts an in-flight run and waits for its cleanup to finish", async () => {
+    let cleanedUp = false;
+    server = createServer({
+      store: new MemoryStore(),
+      config: baseConfig,
+      baseEnv: {},
+      token: TOKEN,
+      shutdownGraceMs: 2000,
+      // On cancel, perform async cleanup (the real engine persists the failure
+      // and removes worktrees here) before the run settles.
+      runGoalImpl: (_g, _c, o = {}) =>
+        new Promise((_resolve, reject) => {
+          o.signal?.addEventListener("abort", () => {
+            setTimeout(() => {
+              cleanedUp = true;
+              const e = new Error("run cancelled");
+              e.name = "AbortError";
+              reject(e);
+            }, 50);
+          });
+        }),
+    });
+    base = `http://127.0.0.1:${await server.start(0)}`;
+
+    await startRun("long running");
+
+    // stop() must not resolve until the aborted run has finished settling, so
+    // its durable cleanup is never cut off.
+    await server.stop();
+    expect(cleanedUp).toBe(true);
+  });
+
+  it("rejects unsafe session ids before they reach git paths/refs", async () => {
+    await startServer();
+    for (const bad of ["../x", "a/b", "", "x".repeat(65)]) {
+      const res = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: auth({ "content-type": "application/json" }),
+        body: JSON.stringify({ goal: "g", sessionId: bad }),
+      });
+      expect(res.status, `expected 400 for sessionId ${JSON.stringify(bad)}`).toBe(400);
+    }
+    // A bounded, safe id (the shape of the UUIDs we mint) is still accepted.
+    const ok = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: auth({ "content-type": "application/json" }),
+      body: JSON.stringify({ goal: "g", sessionId: "Safe_id-123" }),
+    });
+    expect(ok.status).toBe(202);
   });
 });

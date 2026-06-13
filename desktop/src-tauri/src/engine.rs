@@ -120,11 +120,11 @@ impl EngineManager {
 
         if let Some(url) = url.as_deref() {
             request_shutdown(url, token.as_deref());
-        }
-        // Give the engine a brief moment to act on the request and exit on its
-        // own before we force-kill.
-        if child.is_some() {
-            std::thread::sleep(Duration::from_millis(400));
+            // Wait for the engine to actually stop serving before force-killing,
+            // so its graceful path (cancel runs, persist failures, clean up
+            // worktrees) can finish. Bounded well above the server's grace
+            // window so a wedged engine is still killed rather than hanging quit.
+            wait_for_listener_close(url, Duration::from_secs(6));
         }
         if let Some(child) = child {
             // Best-effort fallback: a no-op if the engine already exited.
@@ -168,6 +168,29 @@ Content-Length: 0\r\nConnection: close\r\n\r\n"
     // before returning; the connection closing also signals it has begun.
     let mut buf = [0u8; 256];
     let _ = stream.read(&mut buf);
+}
+
+/// Polls the engine's loopback port until it stops accepting connections (i.e.
+/// the graceful shutdown has closed the listener and the process is exiting),
+/// or `timeout` elapses. On loopback a closed port refuses instantly, so this
+/// returns as soon as the engine is done — typically well under the timeout.
+fn wait_for_listener_close(url: &str, timeout: Duration) {
+    let authority = match url.strip_prefix("http://") {
+        Some(rest) => rest.split('/').next().unwrap_or(rest),
+        None => return,
+    };
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match TcpStream::connect(authority) {
+            // Still listening: the engine hasn't finished shutting down yet.
+            Ok(stream) => {
+                drop(stream);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // Connection refused: the listener is gone and the engine is exiting.
+            Err(_) => return,
+        }
+    }
 }
 
 /// The engine's startup handshake: where to reach it and the token to use.

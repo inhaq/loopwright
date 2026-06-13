@@ -172,6 +172,14 @@ async function readJsonBody(req: IncomingMessage, limitBytes = 1_000_000): Promi
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
+/** A promise that resolves after `ms`, using an unref'd timer (won't hold the process open). */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+}
+
 const STATIC_CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -200,6 +208,12 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   const controllers = new Map<string, AbortController>();
   /** open SSE responses, so a graceful shutdown can end them deterministically */
   const sseClients = new Set<ServerResponse>();
+  /**
+   * Settle promises for in-flight runs, so a graceful shutdown can wait for
+   * each aborted run to finish its durable failure write and worktree cleanup
+   * before the process exits (rather than cutting them off).
+   */
+  const activeRunPromises = new Set<Promise<unknown>>();
   /** memoized graceful-shutdown promise so stop() is safe to call repeatedly */
   let closing: Promise<void> | undefined;
 
@@ -313,6 +327,10 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   }
 
   async function startRun(req: IncomingMessage, res: ServerResponse, cors: Record<string, string>): Promise<void> {
+    // Refuse new work once a graceful shutdown has begun, so we don't start a
+    // run the shutdown won't wait for.
+    if (closing) return send(res, 503, { error: "server is shutting down" }, cors);
+
     let body: StartRunBody;
     try {
       body = ((await readJsonBody(req)) ?? {}) as StartRunBody;
@@ -393,8 +411,10 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
 
     // Fire-and-forget: the run proceeds in the background and the client
     // follows it over SSE. Errors (including cancellation) surface as a terminal
-    // status message.
-    void runGoalImpl(goal, runConfig, {
+    // status message. The settle promise is tracked so a graceful shutdown can
+    // wait for an aborted run to finish persisting its failure and cleaning up
+    // its worktree.
+    const run = runGoalImpl(goal, runConfig, {
       store: tappedStore,
       sessionId,
       resume: body.resume ?? false,
@@ -404,15 +424,18 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     })
       .then((result) => {
         hub.publish(sessionId, "status", { phase: "done", result } satisfies RunStatusData);
-        settle();
       })
       .catch((err: unknown) => {
         hub.publish(sessionId, "status", {
           phase: "error",
           error: String((err as Error)?.message ?? err),
         } satisfies RunStatusData);
+      })
+      .finally(() => {
         settle();
+        activeRunPromises.delete(run);
       });
+    activeRunPromises.add(run);
 
     send(res, 202, { sessionId }, cors);
   }
@@ -531,20 +554,32 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
 
   /**
    * Graceful teardown: stop in-flight work and close connections so the
-   * process can exit promptly without orphaning runs.
+   * process can exit promptly without orphaning runs, all bounded by a single
+   * hard deadline (shutdownGraceMs) so shutdown can never hang.
    *   1. Abort every active run. The cooperative cancel handlers (HttpRunner,
    *      CliRunner, the mechanical gate) fire synchronously and kill detached
-   *      subprocess trees, so no shell/build descendants are left running.
+   *      subprocess trees. Then wait — up to the deadline — for each run to
+   *      finish settling, so its durable failure write and worktree cleanup are
+   *      not cut off (the gap a bare http.close() left open).
    *   2. End open SSE streams — these are long-lived and would otherwise keep
    *      http.close() from ever completing.
    *   3. Stop accepting new connections and wait for drain, then force-close
-   *      anything still lingering after the grace period.
+   *      anything still lingering when the deadline elapses.
    * Memoized so concurrent stop()/shutdown callers share one teardown.
    */
   function closeServer(): Promise<void> {
     if (closing) return closing;
     closing = (async () => {
+      const deadline = Date.now() + shutdownGraceMs;
+      const remaining = (): number => Math.max(0, deadline - Date.now());
+
       for (const controller of controllers.values()) controller.abort();
+      if (activeRunPromises.size > 0) {
+        // Race the run settles against the deadline so a wedged run can't hang
+        // shutdown. The run promises never reject (errors are caught above).
+        await Promise.race([Promise.allSettled([...activeRunPromises]), delay(remaining())]);
+      }
+
       for (const res of sseClients) {
         try {
           res.end();
@@ -553,6 +588,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
         }
       }
       sseClients.clear();
+
       await new Promise<void>((resolve) => {
         let settled = false;
         const finish = (): void => {
@@ -567,7 +603,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
           // close callback can fire and we don't hang on shutdown.
           http.closeAllConnections?.();
           finish();
-        }, shutdownGraceMs);
+        }, remaining());
         if (typeof timer.unref === "function") timer.unref();
       });
     })();

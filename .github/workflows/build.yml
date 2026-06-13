@@ -43,6 +43,12 @@ jobs:
       - name: Test
         run: npm test
 
+      # Surface known advisories in the root dependency tree (the engine that
+      # ships in the sidecar). Run once on Linux since it is OS-independent.
+      - name: Audit dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: npm audit --audit-level=moderate
+
   # Proves the desktop/Tauri release path actually builds: the Bun-compiled
   # engine sidecar, the Vite frontend, the Rust crate (cargo), and the full
   # `tauri build` bundle. The JS `build` job above only exercises the headless
