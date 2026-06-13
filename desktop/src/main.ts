@@ -227,8 +227,22 @@ function renderMonitor(sessionId: string, goal: string): void {
     } else if (msg.type === "status") {
       const phase = document.getElementById("phase") as HTMLElement;
       if (msg.data.phase === "done") {
-        phase.className = "phase done";
-        phase.textContent = "completed";
+        // "done" is not necessarily success: a clean per-task run can still
+        // fail to integrate (merge conflicts / failed verification), and some
+        // tasks may need a human. Reflect that instead of a blanket "completed".
+        const r = msg.data.result ?? {};
+        const integrationFailed = r.integration && r.integration.ok === false;
+        const needsHuman = Array.isArray(r.needsHuman) && r.needsHuman.length > 0;
+        if (integrationFailed) {
+          phase.className = "phase error";
+          phase.textContent = "integration failed — needs attention";
+        } else if (needsHuman) {
+          phase.className = "phase error";
+          phase.textContent = "completed — some tasks need human attention";
+        } else {
+          phase.className = "phase done";
+          phase.textContent = "completed";
+        }
         const btn = h("button", { class: "primary" }, ["View results"]);
         btn.addEventListener("click", () => renderResults(sessionId));
         phase.append(" ", btn);
@@ -310,10 +324,57 @@ async function renderResults(sessionId: string): Promise<void> {
     tasksCard.append(block);
   }
 
+  // Blocking summary cards (shown high up so a merge/verify failure can't be
+  // missed behind all-green task counts). Sourced from the durable event log.
+  const blocking: HTMLElement[] = [];
+
+  const failedEvent = trace.events.find((e) => e.type === "session_failed");
+  if (failedEvent) {
+    const card = h("div", { class: "card error" });
+    card.append(h("h3", {}, ["Run failed"]));
+    card.append(h("div", {}, [String((failedEvent.data as Record<string, unknown>).error ?? "unknown error")]));
+    blocking.push(card);
+  }
+
+  const integrationEvent = trace.events.find((e) => e.type === "integration");
+  if (integrationEvent) {
+    const d = integrationEvent.data as {
+      ok?: boolean;
+      merged?: unknown[];
+      conflicts?: unknown[];
+      integrationBranch?: string;
+      verification?: { passed?: boolean } | null;
+    };
+    const ok = d.ok === true;
+    const conflicts = Array.isArray(d.conflicts) ? d.conflicts : [];
+    const merged = Array.isArray(d.merged) ? d.merged.length : 0;
+    const card = h("div", { class: `card${ok ? "" : " integration-bad"}` });
+    card.append(h("h3", {}, ["Integration & verification"]));
+    card.append(
+      h("div", { class: `phase ${ok ? "done" : "error"}` }, [
+        ok ? "branches merged and full verification passed" : "FAILED — merge conflicts or verification did not pass",
+      ]),
+    );
+    card.append(
+      h("div", { class: "hint" }, [
+        `branch ${String(d.integrationBranch ?? "?")} · merged ${merged} · conflicts ${conflicts.length}`,
+      ]),
+    );
+    if (conflicts.length) {
+      const ul = h("ul", { class: "tx" });
+      for (const c of conflicts) ul.append(h("li", {}, [typeof c === "string" ? c : JSON.stringify(c)]));
+      card.append(h("div", { class: "hint" }, ["Conflicting branches:"]), ul);
+    }
+    if (d.verification && d.verification.passed === false) {
+      card.append(h("div", { class: "error" }, ["Full-tree verification failed after merge."]));
+    }
+    blocking.push(card);
+  }
+
   const raw = h("details", { class: "card" });
   raw.append(h("summary", {}, ["Raw trace (text)"]), h("pre", { class: "log" }, [resp.text]));
 
-  view.append(summary, usage, tasksCard, raw);
+  view.append(summary, ...blocking, usage, tasksCard, raw);
 }
 
 function countStates(trace: TraceResponse["trace"]): Record<string, number> {

@@ -38,6 +38,7 @@ export const EVENT_TYPES = {
   runnerCall: "runner_call",
   sessionFinished: "session_finished",
   integration: "integration",
+  sessionFailed: "session_failed",
 } as const;
 
 function num(v: unknown): number {

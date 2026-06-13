@@ -4,6 +4,7 @@ import { loadConfig } from "../src/config.js";
 import { MockRunner } from "../src/runners/mockRunner.js";
 import type { AgentRunner, RunnerProfile, RunRequest } from "../src/runners/agentRunner.js";
 import { criticGreen, criticBlock, scriptedExecutor } from "../src/adapters/mocks.js";
+import { MemoryStore } from "../src/storage/store.js";
 
 /**
  * End-to-end session tests. The whole config -> createRoles -> plan review ->
@@ -115,6 +116,29 @@ describe("runGoal end-to-end", () => {
       // no actor/critic runner bound
     });
     await expect(runGoal("g", config, { executor: okExecutor })).rejects.toThrow();
+  });
+
+  it("persists 'failed' + a failure event when the run throws", async () => {
+    const store = new MemoryStore();
+    const config = configWithMockRoles();
+    // A runner that throws makes plan review (and thus runGoal) reject.
+    const throwingFactory = (profile: RunnerProfile): AgentRunner => ({
+      profile,
+      run: async () => {
+        throw new Error("kaboom");
+      },
+    });
+
+    await expect(
+      runGoal("g", config, { store, factory: throwingFactory, executor: okExecutor }),
+    ).rejects.toThrow(/kaboom/);
+
+    const sessions = await store.listSessions();
+    expect(sessions).toHaveLength(1);
+    // The durable session is terminal (failed), not stuck "running".
+    expect(sessions[0]!.status).toBe("failed");
+    const events = await store.listEvents(sessions[0]!.id);
+    expect(events.some((e) => e.type === "session_failed")).toBe(true);
   });
 });
 

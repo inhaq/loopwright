@@ -123,6 +123,8 @@ table.kv tr.total td { font-weight: 700; }
 .count.unverified { color: var(--yellow); }
 .count.needs-human { color: var(--red); }
 
+.card.integration-bad { border-color: var(--red); }
+
 .task-block { padding: 8px 0; border-bottom: 1px solid var(--border); }
 .task-head { font-family: var(--mono); display: flex; align-items: center; gap: 8px; }
 .degraded { color: var(--yellow); font-size: 12px; }

@@ -118,126 +118,133 @@ export async function runGoal(
     });
   }
 
-  // Roles, instrumented so every runner invocation emits a structured event
-  // (Task 22). When persisting, calls are recorded to the store's event stream.
-  const onRunnerCall: RunnerCallSink | undefined =
-    store && sessionId
-      ? (e) =>
-          store.recordEvent({
-            sessionId,
-            at: e.at,
-            type: EVENT_TYPES.runnerCall,
-            data: e as unknown as Record<string, unknown>,
-          })
-      : roleOpts.onRunnerCall;
-  const { actor, critic } = createRoles(config, {
-    ...roleOpts,
-    ...(onRunnerCall ? { onRunnerCall } : {}),
-  });
+  // Worktree manager is held here so the `finally` below can guarantee cleanup
+  // even when the run throws partway through.
+  let wtManager: GitWorktreeManager | undefined;
 
-  // Checkpoint to the store and (optionally) fan out to a caller-supplied
-  // observer such as an event log. Absent both, the loop runs unobserved.
-  const observer =
-    (store && sessionId) || extraObserver
-      ? combineObservers(
-          store && sessionId ? storeObserver(store, sessionId) : undefined,
-          extraObserver,
-        )
-      : undefined;
-
-  const baseDeps = {
-    actor,
-    critic,
-    config,
-    cwd,
-    ...(executor ? { executor } : {}),
-    ...(opts.log ? { log: opts.log } : {}),
-    ...(observer ? { observer } : {}),
-  };
-
-  const plan = await runPlanReview(goal, baseDeps);
-  if (store && sessionId) {
-    await store.updateSession(sessionId, {
-      planApproved: plan.approved,
-      planRevisions: plan.revisions,
+  try {
+    // Roles, instrumented so every runner invocation emits a structured event
+    // (Task 22). When persisting, calls are recorded to the store's event stream.
+    const onRunnerCall: RunnerCallSink | undefined =
+      store && sessionId
+        ? (e) =>
+            store.recordEvent({
+              sessionId,
+              at: e.at,
+              type: EVENT_TYPES.runnerCall,
+              data: e as unknown as Record<string, unknown>,
+            })
+        : roleOpts.onRunnerCall;
+    const { actor, critic } = createRoles(config, {
+      ...roleOpts,
+      ...(onRunnerCall ? { onRunnerCall } : {}),
     });
-    await store.recordEvent({
-      sessionId,
-      at: new Date().toISOString(),
-      type: EVENT_TYPES.planReviewed,
-      data: { approved: plan.approved, revisions: plan.revisions, openItems: plan.openItems.length },
-    });
-  }
 
-  // Isolated worktrees + integration (Tasks 20, 21), opt-in via repoDir. Each
-  // task builds in its own git worktree; on success its changes are committed
-  // on a per-task branch for the integrator to merge after the run.
-  const useWorktrees = Boolean(repoDir) && config.useWorktrees;
-  const wtManager = useWorktrees
-    ? new GitWorktreeManager({ repoDir: repoDir as string, sessionId: sessionId ?? randomUUID() })
-    : undefined;
-  const greenBranches: IntegrationBranch[] = [];
+    // Checkpoint to the store and (optionally) fan out to a caller-supplied
+    // observer such as an event log. Absent both, the loop runs unobserved.
+    const observer =
+      (store && sessionId) || extraObserver
+        ? combineObservers(
+            store && sessionId ? storeObserver(store, sessionId) : undefined,
+            extraObserver,
+          )
+        : undefined;
 
-  const schedulerExtra: Partial<SchedulerDeps> = {};
-  if (wtManager) {
-    schedulerExtra.workspaceFor = async (t) => (await wtManager.acquire(t.id)).path;
-    schedulerExtra.onTaskSettled = async (t, r) => {
-      const unblocking =
-        r.outcome?.finalState === "GREEN" || r.outcome?.finalState === "UNVERIFIED_BY_CRITIC";
-      if (r.status === "completed" && unblocking) {
-        const { committed } = await wtManager.commit(t.id, `loopwright(${t.id}): ${t.title}`);
-        const branch = wtManager.branchFor(t.id);
-        if (committed && branch) greenBranches.push({ taskId: t.id, branch });
-      } else if (r.status !== "resumed") {
-        await wtManager.release(t.id, { deleteBranch: true });
-      }
+    const baseDeps = {
+      actor,
+      critic,
+      config,
+      cwd,
+      ...(executor ? { executor } : {}),
+      ...(opts.log ? { log: opts.log } : {}),
+      ...(observer ? { observer } : {}),
     };
-  } else {
-    if (workspaceFor) schedulerExtra.workspaceFor = workspaceFor;
-    if (onTaskSettled) schedulerExtra.onTaskSettled = onTaskSettled;
-  }
 
-  // The scheduler owns ordering, the parallelism cap, dependency-failure
-  // propagation, and (via resumeOutcome) reuse of completed tasks.
-  const results = await runScheduledTasks(plan.plan.tasks, {
-    ...baseDeps,
-    ...schedulerExtra,
-    ...(resume && store && sessionId
-      ? { resumeOutcome: async (t) => (await store.getOutcome(sessionId, t.id))?.outcome }
-      : {}),
-  });
+    const plan = await runPlanReview(goal, baseDeps);
+    if (store && sessionId) {
+      await store.updateSession(sessionId, {
+        planApproved: plan.approved,
+        planRevisions: plan.revisions,
+      });
+      await store.recordEvent({
+        sessionId,
+        at: new Date().toISOString(),
+        type: EVENT_TYPES.planReviewed,
+        data: { approved: plan.approved, revisions: plan.revisions, openItems: plan.openItems.length },
+      });
+    }
 
-  const green: string[] = [];
-  const unverified: string[] = [];
-  const needsHuman: string[] = [];
-  const skipped: string[] = [];
+    // Isolated worktrees + integration (Tasks 20, 21), opt-in via repoDir. Each
+    // task builds in its own git worktree; on success its changes are committed
+    // on a per-task branch for the integrator to merge after the run. `wt` is a
+    // const so its non-undefined narrowing holds inside the closures below;
+    // `wtManager` mirrors it for the `finally` cleanup.
+    const useWorktrees = Boolean(repoDir) && config.useWorktrees;
+    const wt = useWorktrees
+      ? new GitWorktreeManager({ repoDir: repoDir as string, sessionId: sessionId ?? randomUUID() })
+      : undefined;
+    wtManager = wt;
+    const greenBranches: IntegrationBranch[] = [];
 
-  for (const r of results) {
-    if (r.status === "skipped") skipped.push(r.taskId);
-    else if (r.outcome?.finalState === "GREEN") green.push(r.taskId);
-    else if (r.outcome?.finalState === "UNVERIFIED_BY_CRITIC") unverified.push(r.taskId);
-    else needsHuman.push(r.taskId);
-  }
+    const schedulerExtra: Partial<SchedulerDeps> = {};
+    if (wt) {
+      schedulerExtra.workspaceFor = async (t) => (await wt.acquire(t.id)).path;
+      schedulerExtra.onTaskSettled = async (t, r) => {
+        const unblocking =
+          r.outcome?.finalState === "GREEN" || r.outcome?.finalState === "UNVERIFIED_BY_CRITIC";
+        if (r.status === "completed" && unblocking) {
+          const { committed } = await wt.commit(t.id, `loopwright(${t.id}): ${t.title}`);
+          const branch = wt.branchFor(t.id);
+          if (committed && branch) greenBranches.push({ taskId: t.id, branch });
+        } else if (r.status !== "resumed") {
+          await wt.release(t.id, { deleteBranch: true });
+        }
+      };
+    } else {
+      if (workspaceFor) schedulerExtra.workspaceFor = workspaceFor;
+      if (onTaskSettled) schedulerExtra.onTaskSettled = onTaskSettled;
+    }
 
-  if (store && sessionId) {
-    await store.recordEvent({
-      sessionId,
-      at: new Date().toISOString(),
-      type: EVENT_TYPES.sessionFinished,
-      data: {
-        green,
-        unverified,
-        needsHuman,
-        skipped,
-        allVerified: green.length === plan.plan.tasks.length,
-      },
+    // The scheduler owns ordering, the parallelism cap, dependency-failure
+    // propagation, and (via resumeOutcome) reuse of completed tasks.
+    const results = await runScheduledTasks(plan.plan.tasks, {
+      ...baseDeps,
+      ...schedulerExtra,
+      ...(resume && store && sessionId
+        ? { resumeOutcome: async (t) => (await store.getOutcome(sessionId, t.id))?.outcome }
+        : {}),
     });
-  }
 
-  // Integrate the per-task branches and run full verification on the result.
-  let integration: IntegrationResult | undefined;
-  if (wtManager) {
-    if (greenBranches.length > 0) {
+    const green: string[] = [];
+    const unverified: string[] = [];
+    const needsHuman: string[] = [];
+    const skipped: string[] = [];
+
+    for (const r of results) {
+      if (r.status === "skipped") skipped.push(r.taskId);
+      else if (r.outcome?.finalState === "GREEN") green.push(r.taskId);
+      else if (r.outcome?.finalState === "UNVERIFIED_BY_CRITIC") unverified.push(r.taskId);
+      else needsHuman.push(r.taskId);
+    }
+
+    if (store && sessionId) {
+      await store.recordEvent({
+        sessionId,
+        at: new Date().toISOString(),
+        type: EVENT_TYPES.sessionFinished,
+        data: {
+          green,
+          unverified,
+          needsHuman,
+          skipped,
+          allVerified: green.length === plan.plan.tasks.length,
+        },
+      });
+    }
+
+    // Integrate the per-task branches and run full verification on the result.
+    let integration: IntegrationResult | undefined;
+    if (wt && greenBranches.length > 0) {
       const branchTaskIds = new Set(greenBranches.map((b) => b.taskId));
       const verifyCommands = [
         ...new Set(
@@ -254,45 +261,75 @@ export async function runGoal(
         ...(opts.log ? { log: opts.log } : {}),
       });
     }
-    // Tear down any worktrees kept for integration.
-    for (const wt of wtManager.list()) await wtManager.release(wt.taskId);
-  }
 
-  // Durable final status is decided LAST, so an integration that surfaced
-  // conflicts or failed verification (integration.ok === false) marks the
-  // session needs_human rather than leaving the earlier "completed" optimism.
-  if (store && sessionId) {
-    if (integration) {
-      await store.recordEvent({
-        sessionId,
-        at: new Date().toISOString(),
-        type: EVENT_TYPES.integration,
-        data: {
-          ok: integration.ok,
-          merged: integration.merged,
-          conflicts: integration.conflicts,
-          integrationBranch: integration.integrationBranch,
-          verification: integration.verification ?? null,
-        },
+    // Durable final status is decided LAST, so an integration that surfaced
+    // conflicts or failed verification (integration.ok === false) marks the
+    // session needs_human rather than leaving the earlier "completed" optimism.
+    if (store && sessionId) {
+      if (integration) {
+        await store.recordEvent({
+          sessionId,
+          at: new Date().toISOString(),
+          type: EVENT_TYPES.integration,
+          data: {
+            ok: integration.ok,
+            merged: integration.merged,
+            conflicts: integration.conflicts,
+            integrationBranch: integration.integrationBranch,
+            verification: integration.verification ?? null,
+          },
+        });
+      }
+      await store.updateSession(sessionId, {
+        status: finalSessionStatus(needsHuman.length, integration),
       });
     }
-    await store.updateSession(sessionId, {
-      status: finalSessionStatus(needsHuman.length, integration),
-    });
-  }
 
-  return {
-    goal,
-    ...(sessionId ? { sessionId } : {}),
-    plan,
-    results,
-    green,
-    unverified,
-    needsHuman,
-    skipped,
-    allVerified: green.length === plan.plan.tasks.length,
-    ...(integration ? { integration } : {}),
-  };
+    return {
+      goal,
+      ...(sessionId ? { sessionId } : {}),
+      plan,
+      results,
+      green,
+      unverified,
+      needsHuman,
+      skipped,
+      allVerified: green.length === plan.plan.tasks.length,
+      ...(integration ? { integration } : {}),
+    };
+  } catch (err) {
+    // Any throw (planning, runner execution, worktree setup, integration,
+    // cleanup) must leave the durable session in a terminal state, not stuck
+    // "running". Record a structured failure, then rethrow so callers (e.g. the
+    // server's SSE error status) still see it.
+    if (store && sessionId) {
+      try {
+        await store.recordEvent({
+          sessionId,
+          at: new Date().toISOString(),
+          type: EVENT_TYPES.sessionFailed,
+          data: { error: String((err as Error)?.message ?? err) },
+        });
+        await store.updateSession(sessionId, { status: "failed" });
+      } catch {
+        /* best effort: never mask the original error with a persistence error */
+      }
+    }
+    throw err;
+  } finally {
+    // Release any worktrees still held — covers both the normal end of a
+    // worktree run and a throw during the run/integration/cleanup, so a failed
+    // run can't leave .loopwright worktrees/branches behind.
+    if (wtManager) {
+      for (const held of wtManager.list()) {
+        try {
+          await wtManager.release(held.taskId);
+        } catch {
+          /* best effort cleanup */
+        }
+      }
+    }
+  }
 }
 
 /**
