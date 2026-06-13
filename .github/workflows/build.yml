@@ -42,3 +42,95 @@ jobs:
 
       - name: Test
         run: npm test
+
+  # Proves the desktop/Tauri release path actually builds: the Bun-compiled
+  # engine sidecar, the Vite frontend, the Rust crate (cargo), and the full
+  # `tauri build` bundle. The JS `build` job above only exercises the headless
+  # engine, so a break in the desktop shell would otherwise ship unnoticed.
+  desktop:
+    name: desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The sidecar (src/server/index.ts) is compiled to a standalone binary
+      # with Bun, which Tauri then embeds as an external binary.
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache the (large) Cargo build of the Tauri dependency tree, keyed on the
+      # crate's Cargo.lock, so reruns don't recompile from scratch.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+
+      # Tauri v2 needs the GTK/WebKit stack on Linux; the keyring crate's
+      # secret-service backend additionally needs libsecret. macOS and Windows
+      # ship the required system frameworks already.
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libssl-dev \
+            libsecret-1-dev \
+            patchelf \
+            file \
+            build-essential
+
+      # The sidecar bundles src/, which imports from the root package's deps.
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: desktop
+
+      # Surface known-high/critical advisories in the desktop dependency tree.
+      - name: Audit desktop dependencies
+        run: npm audit --audit-level=high
+        working-directory: desktop
+
+      # Build the engine sidecar binary (binaries/loopwright-engine-<triple>)
+      # before the Rust build, which validates the externalBin in build.rs.
+      - name: Build engine sidecar
+        run: npm run build:sidecar
+        working-directory: desktop
+
+      # tsc --noEmit && vite build -> produces desktop/dist for the Tauri build.
+      - name: Build desktop frontend
+        run: npm run build
+        working-directory: desktop
+
+      # Compiles the Rust crate (and runs build.rs / tauri-build) to prove the
+      # native side builds; there are no Rust unit tests yet.
+      - name: Cargo test
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked
+
+      # Full release-path build: bundles the app for the host platform.
+      - name: Tauri build
+        run: npm run tauri build
+        working-directory: desktop
