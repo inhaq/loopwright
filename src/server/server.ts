@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { loadConfig, type LoopwrightConfig } from "../config.js";
 import { runGoal as defaultRunGoal, type RunGoalOptions, type SessionResult } from "../session.js";
@@ -18,9 +18,17 @@ import { tapStoreEvents } from "./store-tap.js";
  * This is a thin transport over the headless engine: it exposes `runGoal` and
  * `buildTrace` over HTTP and streams a run's live progress over Server-Sent
  * Events. It adds NO orchestration policy — start, observe, and review map
- * directly onto existing engine entry points (Req 13.3). The Tauri shell runs
- * this as a sidecar, but it is equally usable from a browser, which is what
- * makes the desktop experience reproducible without a GUI toolchain.
+ * directly onto existing engine entry points (Req 13.3).
+ *
+ * Security model: a run accepts per-request runner profiles, which can spawn
+ * local processes (`cli` runners) and forward stored secrets to arbitrary
+ * endpoints. The server therefore binds loopback only and guards every `/api`
+ * route (except health) with TWO layers:
+ *   1. an unguessable per-process bearer token, delivered out-of-band to the
+ *      trusted UI (a Tauri command, or injected into the served index.html),
+ *      so a page on another origin can never obtain it;
+ *   2. a CORS origin allowlist (loopback + the Tauri webview), so cross-site
+ *      pages get no CORS grant even before the token check.
  */
 
 /** Body accepted by POST /api/runs. */
@@ -57,12 +65,20 @@ export interface CreateServerOptions {
   staticDir?: string;
   /** base env for per-run config resolution (defaults to process.env) */
   baseEnv?: Record<string, string | undefined>;
+  /**
+   * Bearer token required on every `/api` route except health. Defaults to a
+   * fresh random token; pass a fixed value (e.g. in tests, or from the Tauri
+   * shell) to control it.
+   */
+  token?: string;
 }
 
 export interface LoopwrightServer {
   /** the underlying http.Server (call .listen yourself, or use start()) */
   http: Server;
   hub: RunHub;
+  /** the per-process auth token clients must present */
+  token: string;
   /** listen on a port (0 = ephemeral) and resolve with the bound port */
   start(port?: number, host?: string): Promise<number>;
   stop(): Promise<void>;
@@ -70,20 +86,41 @@ export interface LoopwrightServer {
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
-function send(res: ServerResponse, status: number, body: unknown): void {
+function send(res: ServerResponse, status: number, body: unknown, cors: Record<string, string> = {}): void {
   const payload = JSON.stringify(body);
-  res.writeHead(status, { ...JSON_HEADERS, ...corsHeaders() });
+  res.writeHead(status, { ...JSON_HEADERS, ...cors });
   res.end(payload);
 }
 
-function corsHeaders(): Record<string, string> {
-  // The Tauri webview origin (tauri://localhost or http://localhost) differs
-  // from the sidecar origin, and browser dev may serve the UI elsewhere. This
-  // server only ever binds to loopback, so a permissive CORS policy is safe.
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+/** Loopback and the Tauri webview are the only origins ever granted CORS. */
+function originAllowed(origin: string): boolean {
+  if (origin === "tauri://localhost") return true;
+  try {
+    const u = new URL(origin);
+    if (u.hostname === "tauri.localhost") return true;
+    return LOOPBACK_HOSTS.has(u.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * CORS headers for a request. Same-origin / non-browser requests (no Origin)
+ * need none; cross-origin requests get a grant only for allowlisted origins,
+ * and the specific origin is echoed rather than `*` so the policy is explicit.
+ */
+function corsHeadersFor(req: IncomingMessage): Record<string, string> {
+  const origin = req.headers.origin;
+  if (typeof origin !== "string") return {};
+  if (!originAllowed(origin)) return {};
   return {
-    "access-control-allow-origin": "*",
+    "access-control-allow-origin": origin,
+    vary: "Origin",
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type,last-event-id",
+    "access-control-allow-headers": "authorization,content-type,last-event-id",
+    "access-control-max-age": "600",
   };
 }
 
@@ -116,7 +153,20 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   const runGoalImpl = opts.runGoalImpl ?? defaultRunGoal;
   const baseEnv = opts.baseEnv ?? process.env;
   const rates = opts.rates ?? {};
+  const token = opts.token ?? randomUUID();
   const hub = new RunHub();
+
+  /** Constant-time bearer-token check (header or `token` query param). */
+  function authorized(req: IncomingMessage, url: URL): boolean {
+    const auth = req.headers.authorization;
+    let provided: string | undefined;
+    if (typeof auth === "string" && auth.startsWith("Bearer ")) provided = auth.slice(7);
+    else provided = url.searchParams.get("token") ?? undefined;
+    if (!provided) return false;
+    const a = Buffer.from(provided);
+    const b = Buffer.from(token);
+    return a.length === b.length && timingSafeEqual(a, b);
+  }
 
   const http = createHttpServer((req, res) => {
     handle(req, res).catch((err) => {
@@ -129,61 +179,71 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", "http://localhost");
     const pathname = url.pathname;
+    const cors = corsHeadersFor(req);
 
     if (method === "OPTIONS") {
-      res.writeHead(204, corsHeaders());
+      res.writeHead(204, cors);
       res.end();
       return;
     }
 
+    // Health is intentionally unauthenticated (no sensitive data) so the UI can
+    // show connectivity before it has resolved the token.
     if (pathname === "/api/health") {
-      return send(res, 200, { ok: true });
+      return send(res, 200, { ok: true }, cors);
+    }
+
+    // Everything else under /api requires the token. This is the boundary that
+    // stops a page on another origin from starting runs (which can execute
+    // local commands and exfiltrate secrets via runner profiles).
+    if (pathname.startsWith("/api/")) {
+      if (!authorized(req, url)) return send(res, 401, { error: "unauthorized" }, cors);
     }
 
     if (pathname === "/api/runs" && method === "POST") {
-      return startRun(req, res);
+      return startRun(req, res, cors);
     }
 
     const streamMatch = pathname.match(/^\/api\/runs\/([^/]+)\/stream$/);
     if (streamMatch && method === "GET") {
-      return streamRun(req, res, decodeURIComponent(streamMatch[1] as string));
+      return streamRun(req, res, decodeURIComponent(streamMatch[1] as string), cors);
     }
 
     if (pathname === "/api/sessions" && method === "GET") {
       const sessions = await store.listSessions();
       sessions.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-      return send(res, 200, { sessions });
+      return send(res, 200, { sessions }, cors);
     }
 
     const traceMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/trace$/);
     if (traceMatch && method === "GET") {
       const id = decodeURIComponent(traceMatch[1] as string);
       const trace = await buildTrace(store, id, rates);
-      if (!trace.session) return send(res, 404, { error: `no session "${id}"` });
+      if (!trace.session) return send(res, 404, { error: `no session "${id}"` }, cors);
       return send(res, 200, {
         trace,
         text: formatTrace(trace),
         phase: hub.phase(id) ?? null,
-      });
+      }, cors);
     }
 
     if (pathname.startsWith("/api/")) {
-      return send(res, 404, { error: "not found" });
+      return send(res, 404, { error: "not found" }, cors);
     }
 
-    if (staticDir) return serveStatic(res, pathname, staticDir);
-    return send(res, 404, { error: "not found" });
+    if (staticDir) return serveStatic(res, pathname, staticDir, cors);
+    return send(res, 404, { error: "not found" }, cors);
   }
 
-  async function startRun(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function startRun(req: IncomingMessage, res: ServerResponse, cors: Record<string, string>): Promise<void> {
     let body: StartRunBody;
     try {
       body = ((await readJsonBody(req)) ?? {}) as StartRunBody;
     } catch (err) {
-      return send(res, 400, { error: `invalid JSON body: ${String((err as Error).message)}` });
+      return send(res, 400, { error: `invalid JSON body: ${String((err as Error).message)}` }, cors);
     }
     const goal = (body.goal ?? "").trim();
-    if (!goal) return send(res, 400, { error: "goal is required" });
+    if (!goal) return send(res, 400, { error: "goal is required" }, cors);
 
     // Resolve per-run config from the merged env, but never let a caller
     // redirect persistence away from the server's store.
@@ -193,13 +253,13 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     try {
       runConfig = loadConfig(mergedEnv);
     } catch (err) {
-      return send(res, 400, { error: `invalid config: ${String((err as Error).message)}` });
+      return send(res, 400, { error: `invalid config: ${String((err as Error).message)}` }, cors);
     }
     runConfig.dbPath = config.dbPath;
 
     const sessionId = body.sessionId ?? randomUUID();
     if (hub.has(sessionId) && hub.phase(sessionId) === "running") {
-      return send(res, 409, { error: `session ${sessionId} is already running` });
+      return send(res, 409, { error: `session ${sessionId} is already running` }, cors);
     }
 
     // Live wiring: the observer streams transitions/attempts/outcomes; the
@@ -233,15 +293,20 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
         } satisfies RunStatusData);
       });
 
-    send(res, 202, { sessionId });
+    send(res, 202, { sessionId }, cors);
   }
 
-  function streamRun(req: IncomingMessage, res: ServerResponse, sessionId: string): void {
+  function streamRun(
+    req: IncomingMessage,
+    res: ServerResponse,
+    sessionId: string,
+    cors: Record<string, string>,
+  ): void {
     // Unknown session: don't let an SSE connection implicitly create a channel
     // (which would reserve the id). Report 404 so the client can fall back to
     // the trace endpoint for a past run.
     if (!hub.has(sessionId)) {
-      return send(res, 404, { error: `no active run for session "${sessionId}"` });
+      return send(res, 404, { error: `no active run for session "${sessionId}"` }, cors);
     }
 
     res.writeHead(200, {
@@ -249,7 +314,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       "cache-control": "no-cache, no-transform",
       connection: "keep-alive",
       "x-accel-buffering": "no",
-      ...corsHeaders(),
+      ...cors,
     });
 
     // Resume support: a reconnecting client passes the id of the last message
@@ -281,7 +346,12 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     res.on("close", close);
   }
 
-  async function serveStatic(res: ServerResponse, pathname: string, dir: string): Promise<void> {
+  async function serveStatic(
+    res: ServerResponse,
+    pathname: string,
+    dir: string,
+    cors: Record<string, string>,
+  ): Promise<void> {
     // Normalize the asset root to an absolute path so the traversal guard below
     // compares like with like even when `dir` came in relative (e.g. a relative
     // LOOPWRIGHT_STATIC_DIR), which would otherwise reject every request.
@@ -290,14 +360,27 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     const resolved = path.resolve(root, rel);
     // Path-traversal guard: never serve outside the asset directory.
     if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-      return send(res, 403, { error: "forbidden" });
+      return send(res, 403, { error: "forbidden" }, cors);
     }
     const file = await resolveFile(resolved, root);
-    if (!file) return send(res, 404, { error: "not found" });
+    if (!file) return send(res, 404, { error: "not found" }, cors);
+
+    // index.html is served same-origin to the trusted UI; inject the auth token
+    // so the browser build can authenticate without an unauthenticated token
+    // endpoint that another origin could read.
+    if (path.basename(file) === "index.html") {
+      const html = await readFile(file, "utf8");
+      const tag = `<script>window.__LOOPWRIGHT_TOKEN__=${JSON.stringify(token)}</script>`;
+      const injected = html.includes("</head>") ? html.replace("</head>", `${tag}</head>`) : tag + html;
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", ...cors });
+      res.end(injected);
+      return;
+    }
+
     const ext = path.extname(file).toLowerCase();
     res.writeHead(200, {
       "content-type": STATIC_CONTENT_TYPES[ext] ?? "application/octet-stream",
-      ...corsHeaders(),
+      ...cors,
     });
     createReadStream(file).pipe(res);
   }
@@ -323,6 +406,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   return {
     http,
     hub,
+    token,
     start(port = 0, host = "127.0.0.1"): Promise<number> {
       return new Promise<number>((resolve, reject) => {
         http.once("error", reject);

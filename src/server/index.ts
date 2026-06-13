@@ -5,19 +5,21 @@
  * machine-readable line once listening, so a parent process (the Tauri shell)
  * can discover the bound port:
  *
- *   {"loopwright":"listening","host":"127.0.0.1","port":53187}
+ *   {"loopwright":"listening","host":"127.0.0.1","port":53187,"token":"…"}
  *
  * Configuration comes entirely from the environment (see config.ts). Bind
  * settings:
  *   LOOPWRIGHT_PORT        port to bind (default 0 = ephemeral)
  *   LOOPWRIGHT_HOST        host to bind (default 127.0.0.1, loopback only)
  *   LOOPWRIGHT_STATIC_DIR  optional dir of built frontend assets to serve
+ *   LOOPWRIGHT_TOKEN       bearer token required on /api (default: random)
  *
  * Compiled to a single binary via `bun build --compile` and shipped as a
  * Tauri sidecar; also runnable directly (`npm run serve`) to use the UI from a
  * browser without any desktop toolchain.
  */
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { loadConfig } from "../config.js";
 import { openStore } from "../storage/store.js";
 import { createServer } from "./server.js";
@@ -30,9 +32,13 @@ async function main(): Promise<void> {
   // when a relative LOOPWRIGHT_STATIC_DIR is supplied.
   const staticEnv = process.env.LOOPWRIGHT_STATIC_DIR;
   const staticDir = staticEnv ? path.resolve(staticEnv) : undefined;
+  // The supervising process (Tauri) may pin the token via env; otherwise a
+  // fresh random one is generated and reported on the readiness line.
+  const token = process.env.LOOPWRIGHT_TOKEN || randomUUID();
   const server = createServer({
     store,
     config,
+    token,
     ...(staticDir ? { staticDir } : {}),
   });
 
@@ -41,7 +47,7 @@ async function main(): Promise<void> {
   const bound = await server.start(port, host);
 
   // Single-line, parseable readiness signal for the supervising process.
-  console.log(JSON.stringify({ loopwright: "listening", host, port: bound }));
+  console.log(JSON.stringify({ loopwright: "listening", host, port: bound, token }));
 
   const shutdown = (): void => {
     void server.stop().then(() => process.exit(0));

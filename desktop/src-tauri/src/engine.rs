@@ -29,6 +29,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct EngineManager {
     app: AppHandle,
     url: Mutex<Option<String>>,
+    token: Mutex<Option<String>>,
     child: Mutex<Option<CommandChild>>,
 }
 
@@ -37,6 +38,7 @@ impl EngineManager {
         Self {
             app,
             url: Mutex::new(None),
+            token: Mutex::new(None),
             child: Mutex::new(None),
         }
     }
@@ -44,6 +46,11 @@ impl EngineManager {
     /// The engine base URL once started (e.g. "http://127.0.0.1:53187").
     pub fn url(&self) -> Option<String> {
         self.url.lock().unwrap().clone()
+    }
+
+    /// The per-process bearer token the engine requires on its API.
+    pub fn token(&self) -> Option<String> {
+        self.token.lock().unwrap().clone()
     }
 
     /// Spawns the sidecar and blocks until it reports its listening port.
@@ -73,8 +80,8 @@ impl EngineManager {
             .spawn()
             .map_err(|e| e.to_string())?;
 
-        let url = match tauri::async_runtime::block_on(read_listening_url(&mut rx)) {
-            Ok(url) => url,
+        let ready = match tauri::async_runtime::block_on(read_ready(&mut rx)) {
+            Ok(ready) => ready,
             Err(e) => {
                 // Readiness failed (bad output or timeout): don't leak the
                 // spawned process — kill it before surfacing the error.
@@ -87,9 +94,10 @@ impl EngineManager {
         // engine during a long run.
         tauri::async_runtime::spawn(async move { while rx.recv().await.is_some() {} });
 
-        *self.url.lock().unwrap() = Some(url.clone());
+        *self.url.lock().unwrap() = Some(ready.url.clone());
+        *self.token.lock().unwrap() = ready.token;
         *self.child.lock().unwrap() = Some(child);
-        Ok(url)
+        Ok(ready.url)
     }
 
     /// Kills the running sidecar (if any) and starts a fresh one. Used after
@@ -99,12 +107,19 @@ impl EngineManager {
             let _ = child.kill();
         }
         *self.url.lock().unwrap() = None;
+        *self.token.lock().unwrap() = None;
         self.start()
     }
 }
 
-/// Reads sidecar output until the readiness line is seen, then returns the URL.
-async fn read_listening_url(rx: &mut Receiver<CommandEvent>) -> Result<String, String> {
+/// The engine's startup handshake: where to reach it and the token to use.
+struct Ready {
+    url: String,
+    token: Option<String>,
+}
+
+/// Reads sidecar output until the readiness line is seen, then returns it.
+async fn read_ready(rx: &mut Receiver<CommandEvent>) -> Result<Ready, String> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut buf = String::new();
 
@@ -121,8 +136,8 @@ async fn read_listening_url(rx: &mut Receiver<CommandEvent>) -> Result<String, S
         match event {
             Some(CommandEvent::Stdout(bytes)) | Some(CommandEvent::Stderr(bytes)) => {
                 buf.push_str(&String::from_utf8_lossy(&bytes));
-                if let Some(url) = parse_listening(&buf) {
-                    return Ok(url);
+                if let Some(ready) = parse_ready(&buf) {
+                    return Ok(ready);
                 }
             }
             Some(CommandEvent::Error(e)) => return Err(format!("engine error: {e}")),
@@ -136,7 +151,7 @@ async fn read_listening_url(rx: &mut Receiver<CommandEvent>) -> Result<String, S
 }
 
 /// Scans accumulated output for the `{"loopwright":"listening",...}` line.
-fn parse_listening(buf: &str) -> Option<String> {
+fn parse_ready(buf: &str) -> Option<Ready> {
     for line in buf.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
@@ -149,7 +164,11 @@ fn parse_listening(buf: &str) -> Option<String> {
                     .and_then(|x| x.as_str())
                     .unwrap_or("127.0.0.1");
                 let port = v.get("port").and_then(|x| x.as_u64())?;
-                return Some(format!("http://{host}:{port}"));
+                let token = v.get("token").and_then(|x| x.as_str()).map(str::to_string);
+                return Some(Ready {
+                    url: format!("http://{host}:{port}"),
+                    token,
+                });
             }
         }
     }

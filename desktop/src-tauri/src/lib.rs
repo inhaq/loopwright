@@ -17,6 +17,14 @@ fn engine_url(state: tauri::State<EngineManager>) -> Result<String, String> {
     state.url().ok_or_else(|| "engine not started".to_string())
 }
 
+/// Returns the per-process bearer token the engine API requires.
+#[tauri::command]
+fn engine_token(state: tauri::State<EngineManager>) -> Result<String, String> {
+    state
+        .token()
+        .ok_or_else(|| "engine not started".to_string())
+}
+
 /// Restarts the engine sidecar (e.g. after secrets change) and returns its URL.
 #[tauri::command]
 fn restart_engine(state: tauri::State<EngineManager>) -> Result<String, String> {
@@ -55,6 +63,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             engine_url,
+            engine_token,
             restart_engine,
             set_secret,
             delete_secret,

@@ -16,6 +16,7 @@ export function isTauri(): boolean {
 }
 
 let cachedBase: string | undefined;
+let cachedToken: string | undefined;
 
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const { invoke } = await import("@tauri-apps/api/core");
@@ -35,14 +36,38 @@ export async function apiBase(): Promise<string> {
   return cachedBase;
 }
 
+/**
+ * The per-process bearer token guarding the engine API. In Tauri it comes from
+ * a command (never crosses an origin boundary); in the browser build it is
+ * injected into the served index.html as `window.__LOOPWRIGHT_TOKEN__`, so only
+ * a page actually loaded from the loopback server can read it.
+ */
+async function authToken(): Promise<string> {
+  if (cachedToken !== undefined) return cachedToken;
+  if (isTauri()) {
+    cachedToken = await tauriInvoke<string>("engine_token");
+  } else {
+    cachedToken = (window as unknown as { __LOOPWRIGHT_TOKEN__?: string }).__LOOPWRIGHT_TOKEN__ ?? "";
+  }
+  return cachedToken;
+}
+
+async function authHeaders(extra: Record<string, string> = {}): Promise<Record<string, string>> {
+  const t = await authToken();
+  return t ? { ...extra, authorization: `Bearer ${t}` } : extra;
+}
+
 /** Re-spawns the engine sidecar (Tauri only) so newly stored secrets apply. */
 export async function restartEngine(): Promise<void> {
   if (!isTauri()) return;
+  // A restart yields a fresh process with a new token + port; drop both caches
+  // so they are re-resolved on the next request.
   cachedBase = await tauriInvoke<string>("restart_engine");
+  cachedToken = undefined;
 }
 
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch((await apiBase()) + path);
+  const res = await fetch((await apiBase()) + path, { headers: await authHeaders() });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json() as Promise<T>;
 }
@@ -57,7 +82,7 @@ export interface StartRunBody {
 export async function startRun(body: StartRunBody): Promise<string> {
   const res = await fetch((await apiBase()) + "/api/runs", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: await authHeaders({ "content-type": "application/json" }),
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
@@ -93,8 +118,16 @@ export async function openStream(
   onMessage: (msg: RunMessage) => void,
   onError?: (err: Event) => void,
 ): Promise<() => void> {
-  const url = (await apiBase()) + `/api/runs/${encodeURIComponent(sessionId)}/stream`;
-  const es = new EventSource(url);
+  // EventSource cannot set headers, so the token rides as a query param (the
+  // server accepts it either way). Resolve against the document base so a
+  // same-origin ("") base still produces an absolute URL.
+  const t = await authToken();
+  const url = new URL(
+    (await apiBase()) + `/api/runs/${encodeURIComponent(sessionId)}/stream`,
+    typeof window !== "undefined" ? window.location.href : "http://127.0.0.1",
+  );
+  if (t) url.searchParams.set("token", t);
+  const es = new EventSource(url.toString());
   const types: RunMessage["type"][] = ["status", "transition", "attempt", "outcome", "event", "log"];
   for (const type of types) {
     es.addEventListener(type, (ev) => {

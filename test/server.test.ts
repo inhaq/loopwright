@@ -11,10 +11,15 @@ import type { TaskOutcome } from "../src/engine/loop.js";
  * here we verify the HTTP/SSE surface that the desktop shell consumes — start a
  * run, observe it live, and read its trace — using a simulated `runGoal` that
  * drives the exact hooks the real engine uses (store events, observer
- * transitions/outcomes, log lines).
+ * transitions/outcomes, log lines). A fixed token exercises the auth boundary.
  */
 
 const baseConfig: LoopwrightConfig = loadConfig({});
+const TOKEN = "test-token";
+const auth = (extra: Record<string, string> = {}): Record<string, string> => ({
+  ...extra,
+  authorization: `Bearer ${TOKEN}`,
+});
 
 function greenOutcome(taskId: string): TaskOutcome {
   return {
@@ -79,9 +84,20 @@ let server: LoopwrightServer;
 let base: string;
 
 async function startServer(runGoalImpl: RunGoalImpl = simulatedRun): Promise<void> {
-  server = createServer({ store: new MemoryStore(), config: baseConfig, runGoalImpl, baseEnv: {} });
+  server = createServer({ store: new MemoryStore(), config: baseConfig, runGoalImpl, baseEnv: {}, token: TOKEN });
   const port = await server.start(0);
   base = `http://127.0.0.1:${port}`;
+}
+
+/** Starts a run and returns its session id (with auth). */
+async function startRun(goal: string): Promise<string> {
+  const res = await fetch(`${base}/api/runs`, {
+    method: "POST",
+    headers: auth({ "content-type": "application/json" }),
+    body: JSON.stringify({ goal }),
+  });
+  expect(res.status).toBe(202);
+  return ((await res.json()) as { sessionId: string }).sessionId;
 }
 
 afterEach(async () => {
@@ -125,7 +141,7 @@ async function readSse(
 describe("server: health + validation", () => {
   beforeEach(() => startServer());
 
-  it("reports health", async () => {
+  it("reports health without a token", async () => {
     const res = await fetch(`${base}/api/health`);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
@@ -134,17 +150,40 @@ describe("server: health + validation", () => {
   it("rejects a run with no goal", async () => {
     const res = await fetch(`${base}/api/runs`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: auth({ "content-type": "application/json" }),
       body: JSON.stringify({ goal: "  " }),
     });
     expect(res.status).toBe(400);
   });
 
   it("404s unknown api routes and missing traces", async () => {
-    expect((await fetch(`${base}/api/nope`)).status).toBe(404);
-    expect((await fetch(`${base}/api/sessions/ghost/trace`)).status).toBe(404);
+    expect((await fetch(`${base}/api/nope`, { headers: auth() })).status).toBe(404);
+    expect((await fetch(`${base}/api/sessions/ghost/trace`, { headers: auth() })).status).toBe(404);
     // Streaming a session that was never started must not implicitly create it.
-    expect((await fetch(`${base}/api/runs/ghost/stream`)).status).toBe(404);
+    expect((await fetch(`${base}/api/runs/ghost/stream`, { headers: auth() })).status).toBe(404);
+  });
+});
+
+describe("server: auth boundary", () => {
+  beforeEach(() => startServer());
+
+  it("rejects /api requests without the token", async () => {
+    expect((await fetch(`${base}/api/sessions`)).status).toBe(401);
+    const run = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ goal: "do it" }),
+    });
+    expect(run.status).toBe(401);
+    // A wrong token is rejected too.
+    expect((await fetch(`${base}/api/sessions`, { headers: { authorization: "Bearer nope" } })).status).toBe(401);
+  });
+
+  it("accepts the token via query param (for EventSource)", async () => {
+    const sessionId = await startRun("observe");
+    const res = await fetch(`${base}/api/runs/${sessionId}/stream?token=${TOKEN}`);
+    expect(res.status).toBe(200);
+    await res.body?.cancel();
   });
 });
 
@@ -152,19 +191,13 @@ describe("server: run lifecycle + trace", () => {
   beforeEach(() => startServer());
 
   it("starts a run, persists it, and serves its trace + session list", async () => {
-    const res = await fetch(`${base}/api/runs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ goal: "ship it" }),
-    });
-    expect(res.status).toBe(202);
-    const { sessionId } = (await res.json()) as { sessionId: string };
+    const sessionId = await startRun("ship it");
     expect(sessionId).toBeTruthy();
 
     // The simulated run is synchronous in effect; poll the trace until done.
     let trace: any;
     for (let i = 0; i < 50; i++) {
-      const t = await fetch(`${base}/api/sessions/${sessionId}/trace`);
+      const t = await fetch(`${base}/api/sessions/${sessionId}/trace`, { headers: auth() });
       if (t.status === 200) {
         trace = await t.json();
         if (trace.trace.session?.status === "completed") break;
@@ -178,7 +211,7 @@ describe("server: run lifecycle + trace", () => {
     expect(trace.trace.usage.total.calls).toBe(1);
     expect(typeof trace.text).toBe("string");
 
-    const list = (await (await fetch(`${base}/api/sessions`)).json()) as { sessions: any[] };
+    const list = (await (await fetch(`${base}/api/sessions`, { headers: auth() })).json()) as { sessions: any[] };
     expect(list.sessions.some((s) => s.id === sessionId)).toBe(true);
   });
 
@@ -188,21 +221,15 @@ describe("server: run lifecycle + trace", () => {
       store: new MemoryStore(),
       config: baseConfig,
       baseEnv: {},
+      token: TOKEN,
       runGoalImpl: async () => {
         throw new Error("boom");
       },
     });
     base = `http://127.0.0.1:${await server.start(0)}`;
 
-    const { sessionId } = (await (
-      await fetch(`${base}/api/runs`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ goal: "explode" }),
-      })
-    ).json()) as { sessionId: string };
-
-    const stream = await fetch(`${base}/api/runs/${sessionId}/stream`);
+    const sessionId = await startRun("explode");
+    const stream = await fetch(`${base}/api/runs/${sessionId}/stream`, { headers: auth() });
     const msgs = await readSse(stream, (m) => m.some((x) => x.event === "status" && x.data.phase === "error"));
     const err = msgs.find((m) => m.event === "status" && m.data.phase === "error");
     expect(err?.data.error).toContain("boom");
@@ -213,15 +240,9 @@ describe("server: live SSE stream", () => {
   beforeEach(() => startServer());
 
   it("replays buffered messages then signals done, in order with monotonic ids", async () => {
-    const { sessionId } = (await (
-      await fetch(`${base}/api/runs`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ goal: "observe me" }),
-      })
-    ).json()) as { sessionId: string };
+    const sessionId = await startRun("observe me");
 
-    const stream = await fetch(`${base}/api/runs/${sessionId}/stream`);
+    const stream = await fetch(`${base}/api/runs/${sessionId}/stream`, { headers: auth() });
     const msgs = await readSse(stream, (m) => m.some((x) => x.event === "status" && x.data.phase === "done"));
 
     const types = msgs.map((m) => m.event);
@@ -241,22 +262,16 @@ describe("server: live SSE stream", () => {
   });
 
   it("resumes from Last-Event-ID, skipping already-seen messages", async () => {
-    const { sessionId } = (await (
-      await fetch(`${base}/api/runs`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ goal: "resume me" }),
-      })
-    ).json()) as { sessionId: string };
+    const sessionId = await startRun("resume me");
 
     // Let the run finish so the whole buffer exists.
-    const first = await fetch(`${base}/api/runs/${sessionId}/stream`);
+    const first = await fetch(`${base}/api/runs/${sessionId}/stream`, { headers: auth() });
     const all = await readSse(first, (m) => m.some((x) => x.event === "status" && x.data.phase === "done"));
     expect(all.length).toBeGreaterThan(1);
     const cutoff = all[1]!.id;
 
     const resumed = await fetch(`${base}/api/runs/${sessionId}/stream`, {
-      headers: { "last-event-id": String(cutoff) },
+      headers: auth({ "last-event-id": String(cutoff) }),
     });
     const rest = await readSse(resumed, (m) => m.some((x) => x.event === "status" && x.data.phase === "done"));
     expect(rest.every((m) => m.id > cutoff)).toBe(true);
