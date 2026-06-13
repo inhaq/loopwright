@@ -54,24 +54,31 @@ function isUnblocking(outcome: TaskOutcome | undefined): boolean {
   );
 }
 
-/** Orders tasks so dependencies precede dependents (stable; assumes acyclic). */
+/** Orders tasks so dependencies precede dependents (stable; rejects cycles). */
 function dependencyOrder(tasks: TaskSpec[]): TaskSpec[] {
   const byId = new Map(tasks.map((t) => [t.id, t]));
   const visited = new Set<string>();
   const ordered: TaskSpec[] = [];
-  const visit = (task: TaskSpec, stack: Set<string>): void => {
+  const visit = (task: TaskSpec, stack: string[]): void => {
     if (visited.has(task.id)) return;
-    if (stack.has(task.id)) return; // cycle guard; engine validates elsewhere
-    stack.add(task.id);
+    if (stack.includes(task.id)) {
+      // A back-edge means the plan's dependency graph is cyclic and cannot be
+      // scheduled. Fail loudly with the offending cycle rather than silently
+      // dropping the edge (which would yield a partial order and cascading
+      // skips); plans are expected to be acyclic (enforced in critic review).
+      const cycle = [...stack.slice(stack.indexOf(task.id)), task.id].join(" -> ");
+      throw new Error(`Plan dependency cycle detected: ${cycle}`);
+    }
+    stack.push(task.id);
     for (const depId of task.dependencies) {
       const dep = byId.get(depId);
       if (dep) visit(dep, stack);
     }
-    stack.delete(task.id);
+    stack.pop();
     visited.add(task.id);
     ordered.push(task);
   };
-  for (const t of tasks) visit(t, new Set());
+  for (const t of tasks) visit(t, []);
   return ordered;
 }
 

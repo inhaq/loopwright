@@ -60,7 +60,21 @@ export const HttpRunnerOptionsSchema = z
         /** HTTP status codes that indicate an exhausted usage/rate window */
         statusCodes: z.array(z.number().int()).default([429]),
         /** case-insensitive regex tested against an error response body */
-        pattern: z.string().optional(),
+        pattern: z
+          .string()
+          .optional()
+          .refine(
+            (p) => {
+              if (p === undefined) return true;
+              try {
+                new RegExp(p, "i");
+                return true;
+              } catch {
+                return false;
+              }
+            },
+            { message: "quota.pattern must be a valid regular expression" },
+          ),
       })
       .default({ statusCodes: [429] }),
   })
@@ -109,11 +123,20 @@ export class HttpRunner implements AgentRunner {
   private readonly opts: HttpRunnerOptions;
   private readonly fetchImpl: FetchLike;
   private readonly env: NodeJS.ProcessEnv;
+  /** quota body matcher, compiled once at construction (undefined when unset) */
+  private readonly quotaPattern?: RegExp;
 
   constructor(profile: RunnerProfile, deps: HttpRunnerDeps = {}) {
     this.profile = profile;
     // Validate eagerly so a bad profile fails at construction, not mid-run.
     this.opts = HttpRunnerOptionsSchema.parse(profile.options ?? {});
+    // Precompile the quota pattern now (the schema already proved it valid) so
+    // a bad regex can never throw inside run()'s try/catch and get mistaken for
+    // a transport failure.
+    this.quotaPattern =
+      this.opts.quota.pattern !== undefined
+        ? new RegExp(this.opts.quota.pattern, "i")
+        : undefined;
     const globalFetch = (globalThis as { fetch?: FetchLike }).fetch;
     const resolved = deps.fetch ?? globalFetch;
     if (!resolved) {
@@ -148,8 +171,7 @@ export class HttpRunner implements AgentRunner {
         const errText = await safeText(res);
         const quotaExhausted =
           this.opts.quota.statusCodes.includes(res.status) ||
-          (this.opts.quota.pattern !== undefined &&
-            new RegExp(this.opts.quota.pattern, "i").test(errText));
+          (this.quotaPattern !== undefined && this.quotaPattern.test(errText));
         return {
           text: "",
           quotaExhausted,
