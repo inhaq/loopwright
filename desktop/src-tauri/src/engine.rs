@@ -320,7 +320,8 @@ mod tests {
         request_shutdown("ftp://example.com", Some("t"));
     }
 
-    /// Returns immediately (well under the timeout) when nothing is listening.
+    /// Returns on connection refusal (does not wait out the timeout) when
+    /// nothing is listening.
     #[test]
     fn wait_for_listener_close_returns_when_refused() {
         // Bind then drop to obtain a port that is no longer accepting.
@@ -331,10 +332,14 @@ mod tests {
         let url = format!("http://{addr}");
 
         let start = Instant::now();
-        wait_for_listener_close(&url, Duration::from_secs(2));
+        wait_for_listener_close(&url, Duration::from_secs(5));
+        // It must return on refusal rather than hang to the timeout. Windows
+        // loopback refusal can take ~1s, so allow a generous margin while still
+        // proving it returned well before the 5s timeout.
         assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "should return promptly on connection refused"
+            start.elapsed() < Duration::from_secs(3),
+            "should return on connection refused, not wait out the timeout (elapsed {:?})",
+            start.elapsed()
         );
     }
 
