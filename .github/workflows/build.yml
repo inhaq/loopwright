@@ -151,3 +151,15 @@ jobs:
         if: matrix.os != 'ubuntu-latest'
         run: npm run tauri build
         working-directory: desktop
+
+      # Preserve the built installers so QA and users have a downloadable
+      # deliverable from every CI run. The release workflow publishes tagged
+      # builds to a GitHub Release; this keeps untagged builds available too.
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: loopwright-installers-${{ matrix.os }}
+          path: |
+            desktop/src-tauri/target/release/bundle/**
+          if-no-files-found: error
+          retention-days: 14

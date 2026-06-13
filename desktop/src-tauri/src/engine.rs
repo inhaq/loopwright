@@ -255,3 +255,130 @@ fn parse_ready(buf: &str) -> Option<Ready> {
     }
     None
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::{request_shutdown, wait_for_listener_close};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// request_shutdown posts to /api/shutdown with the bearer token.
+    #[test]
+    fn request_shutdown_sends_authorized_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}");
+
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).expect("read");
+            // Respond so the client's read() returns promptly.
+            let _ = sock.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        request_shutdown(&url, Some("secret-token"));
+
+        let req = server.join().expect("join");
+        assert!(
+            req.starts_with("POST /api/shutdown HTTP/1.1"),
+            "unexpected request line: {req}"
+        );
+        assert!(
+            req.contains("Authorization: Bearer secret-token"),
+            "missing/incorrect auth header: {req}"
+        );
+    }
+
+    /// request_shutdown omits the auth header when no token is known, and a bad
+    /// (non-http) url is a no-op rather than a panic.
+    #[test]
+    fn request_shutdown_handles_no_token_and_bad_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}");
+
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).expect("read");
+            let _ = sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        request_shutdown(&url, None);
+        let req = server.join().expect("join");
+        assert!(!req.contains("Authorization:"), "should not send auth: {req}");
+
+        // Non-http url must not panic or hang.
+        request_shutdown("ftp://example.com", Some("t"));
+    }
+
+    /// Returns immediately (well under the timeout) when nothing is listening.
+    #[test]
+    fn wait_for_listener_close_returns_when_refused() {
+        // Bind then drop to obtain a port that is no longer accepting.
+        let addr = {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr")
+        };
+        let url = format!("http://{addr}");
+
+        let start = Instant::now();
+        wait_for_listener_close(&url, Duration::from_secs(2));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "should return promptly on connection refused"
+        );
+    }
+
+    /// Returns once the listener actually closes, not before.
+    #[test]
+    fn wait_for_listener_close_waits_for_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}");
+
+        let closer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(listener); // stop accepting
+        });
+
+        let start = Instant::now();
+        wait_for_listener_close(&url, Duration::from_secs(5));
+        let elapsed = start.elapsed();
+        closer.join().expect("join");
+
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "should not return before the listener closes (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should return shortly after close, not at the timeout (elapsed {elapsed:?})"
+        );
+    }
+
+    /// Respects the timeout when the listener never closes (a wedged engine).
+    #[test]
+    fn wait_for_listener_close_respects_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}");
+
+        let start = Instant::now();
+        wait_for_listener_close(&url, Duration::from_millis(300));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "should wait out the timeout while still listening (elapsed {elapsed:?})"
+        );
+        drop(listener);
+    }
+}

@@ -1,6 +1,6 @@
 {
   "name": "loopwright-desktop",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Tauri desktop shell for the Loopwright actor-critic engine",
