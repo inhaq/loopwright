@@ -41,11 +41,11 @@ Each task references the requirement(s) it satisfies.
 
 ## Milestone 3 — Persistence and resilience
 
-- [ ] 16. Local store for sessions, tasks, attempts, transitions, outcomes
+- [~] 16. Local store for sessions, tasks, attempts, transitions, outcomes
   _(Req 10, 11)_
-- [ ] 17. Checkpoint on each transition; resume a run after interruption
+- [~] 17. Checkpoint on each transition; resume a run after interruption
   _(Req 10)_
-- [ ] 18. Stuck-detection watchdog (no-progress threshold) feeding the loop
+- [~] 18. Stuck-detection watchdog (no-progress threshold) feeding the loop
   _(Req 2, 5)_
 
 ## Milestone 4 — Parallel execution

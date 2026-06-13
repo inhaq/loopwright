@@ -17,6 +17,7 @@ import {
   type TaskState,
 } from "../domain/stateMachine.js";
 import { runMechanicalGate, type CommandExecutor } from "./mechanicalGate.js";
+import { guardProgress } from "./watchdog.js";
 import { redact, redactAndTruncate } from "./redaction.js";
 import { parseCriticResponse, REPAIR_HINT } from "./criticParser.js";
 import type {
@@ -36,6 +37,44 @@ export interface LoopDeps {
   /** injectable command runner for the mechanical gate (tests/build/lint) */
   executor?: CommandExecutor;
   log?: (line: string) => void;
+  /** optional observer for checkpointing / event logging (Milestones 3, 5) */
+  observer?: LoopObserver;
+  /**
+   * No-progress threshold (ms) for the stuck watchdog; overrides
+   * config.stuckThresholdMs when set. <= 0 disables it. (Milestone 3, Task 18)
+   */
+  stuckThresholdMs?: number;
+}
+
+/** A single state transition, surfaced to observers as it happens. */
+export interface TransitionEvent {
+  taskId: string;
+  from: TaskState;
+  event: TaskEvent;
+  to: TaskState;
+  reason: string;
+  at: string;
+}
+
+/** A completed build attempt, surfaced to observers. */
+export interface AttemptEvent {
+  taskId: string;
+  /** 1-based attempt number */
+  attempt: number;
+  summary: string;
+  at: string;
+}
+
+/**
+ * Observer hooks fired by the loop. Each is optional and awaited, so a store
+ * (Milestone 3) can checkpoint every transition durably before the loop
+ * advances, and the event log (Milestone 5) can record the same stream. When no
+ * observer is supplied the loop behaves exactly as before.
+ */
+export interface LoopObserver {
+  transition?(e: TransitionEvent): void | Promise<void>;
+  attempt?(e: AttemptEvent): void | Promise<void>;
+  outcome?(o: TaskOutcome): void | Promise<void>;
 }
 
 export interface HistoryEntry {
@@ -173,6 +212,7 @@ export async function runTask(
 ): Promise<TaskOutcome> {
   const { config } = deps;
   const history: HistoryEntry[] = [];
+  const stuckThresholdMs = deps.stuckThresholdMs ?? config.stuckThresholdMs;
 
   let state: TaskState = "PLANNED";
   let buildAttempts = 0;
@@ -187,24 +227,38 @@ export async function runTask(
   let lastTouched: string[] = [];
   let lastGate: MechanicalGateResult = { passed: true, steps: [] };
 
-  const fire = (event: TaskEvent, reason: string): TaskState => {
+  const fire = async (event: TaskEvent, reason: string): Promise<TaskState> => {
     const from = state;
     state = nextState(from, event);
-    history.push({ at: new Date().toISOString(), from, event, to: state, reason });
+    const at = new Date().toISOString();
+    history.push({ at, from, event, to: state, reason });
     deps.log?.(`[${task.id}] ${from} --(${event})--> ${state}  ${reason}`);
+    await deps.observer?.transition?.({ taskId: task.id, from, event, to: state, reason, at });
     return state;
   };
 
-  state = fire("BUILD_STARTED", "initial build");
+  state = await fire("BUILD_STARTED", "initial build");
 
   while (!isTerminal(state)) {
     switch (state) {
       case "BUILDING": {
         buildAttempts++;
-        const built = await deps.actor.build(task, feedback);
+        const guardedBuild = await guardProgress(deps.actor.build(task, feedback), stuckThresholdMs);
+        if (guardedBuild.stuck) {
+          degradedReason = `No progress within ${guardedBuild.elapsedMs}ms while building (stuck).`;
+          await fire("STUCK_ABORTED", degradedReason);
+          break;
+        }
+        const built = guardedBuild.value;
         feedback = undefined;
         lastDiff = built.diff;
         lastTouched = built.touchedFiles;
+        await deps.observer?.attempt?.({
+          taskId: task.id,
+          attempt: buildAttempts,
+          summary: built.summary,
+          at: new Date().toISOString(),
+        });
 
         if (config.mechanicalGate) {
           lastGate = await runMechanicalGate(task.verifyCommands, {
@@ -212,14 +266,14 @@ export async function runTask(
             ...(deps.executor ? { executor: deps.executor } : {}),
           });
           if (lastGate.passed) {
-            fire("MECHANICAL_PASSED", `gate passed (${lastGate.steps.length} step(s))`);
+            await fire("MECHANICAL_PASSED", `gate passed (${lastGate.steps.length} step(s))`);
           } else {
             const failed = lastGate.steps.find((s) => !s.passed);
-            fire("MECHANICAL_FAILED", `gate failed: ${failed?.command ?? "unknown"}`);
+            await fire("MECHANICAL_FAILED", `gate failed: ${failed?.command ?? "unknown"}`);
           }
         } else {
           lastGate = { passed: true, steps: [] };
-          fire("MECHANICAL_PASSED", "mechanical gate disabled by config");
+          await fire("MECHANICAL_PASSED", "mechanical gate disabled by config");
         }
         break;
       }
@@ -227,23 +281,29 @@ export async function runTask(
       case "MECHANICAL_FAILED": {
         if (mechFixAttempts >= config.mechanicalFixMax) {
           degradedReason = `Mechanical gate still failing after ${mechFixAttempts} fix attempt(s).`;
-          fire("EXCEEDED_LIMIT", degradedReason);
+          await fire("EXCEEDED_LIMIT", degradedReason);
           break;
         }
         mechFixAttempts++;
         feedback = { mechanicalFailure: lastGate };
-        fire("RETRY_BUILD", `actor fixing mechanical failure (attempt ${mechFixAttempts})`);
+        await fire("RETRY_BUILD", `actor fixing mechanical failure (attempt ${mechFixAttempts})`);
         break;
       }
 
       case "CRITIC_REVIEWING": {
         const bundle = buildBundle(task, lastDiff, lastTouched, lastGate);
-        const review = await obtainTaskReview(deps, bundle);
+        const guardedReview = await guardProgress(obtainTaskReview(deps, bundle), stuckThresholdMs);
+        if (guardedReview.stuck) {
+          degradedReason = `No progress within ${guardedReview.elapsedMs}ms during critic review (stuck).`;
+          await fire("STUCK_ABORTED", degradedReason);
+          break;
+        }
+        const review = guardedReview.value;
 
         switch (review.kind) {
           case "green": {
             accumulatedNits.push(...review.nits);
-            fire("CRITIC_GREEN", "critic green pass");
+            await fire("CRITIC_GREEN", "critic green pass");
             break;
           }
           case "changes": {
@@ -252,10 +312,10 @@ export async function runTask(
             if (reviewCycles >= config.taskReviewCyclesMax) {
               unresolvedBlockers = review.blockers;
               degradedReason = `Critic still blocking after ${reviewCycles} review cycle(s).`;
-              fire("EXCEEDED_LIMIT", degradedReason);
+              await fire("EXCEEDED_LIMIT", degradedReason);
             } else {
               feedback = { criticBlockers: review.blockers };
-              fire(
+              await fire(
                 "CRITIC_CHANGES_REQUIRED",
                 `${review.blockers.length} blocker(s) (cycle ${reviewCycles})`,
               );
@@ -265,17 +325,17 @@ export async function runTask(
           case "unavailable": {
             accumulatedNits.push(...review.selfReviewNotes);
             degradedReason = review.reason;
-            fire("CRITIC_UNAVAILABLE", review.reason);
+            await fire("CRITIC_UNAVAILABLE", review.reason);
             break;
           }
           case "paused": {
             degradedReason = review.reason;
-            fire("MALFORMED_GIVEUP", review.reason); // routes to NEEDS_HUMAN
+            await fire("MALFORMED_GIVEUP", review.reason); // routes to NEEDS_HUMAN
             break;
           }
           case "malformed": {
             degradedReason = review.reason;
-            fire("MALFORMED_GIVEUP", review.reason);
+            await fire("MALFORMED_GIVEUP", review.reason);
             break;
           }
         }
@@ -283,13 +343,13 @@ export async function runTask(
       }
 
       case "CHANGES_REQUIRED": {
-        fire("RETRY_BUILD", "actor addressing critic blockers");
+        await fire("RETRY_BUILD", "actor addressing critic blockers");
         break;
       }
     }
   }
 
-  return {
+  const outcome: TaskOutcome = {
     taskId: task.id,
     finalState: state,
     verified: state === "GREEN",
@@ -301,6 +361,8 @@ export async function runTask(
     ...(degradedReason ? { degradedReason } : {}),
     lastDiff,
   };
+  await deps.observer?.outcome?.(outcome);
+  return outcome;
 }
 
 // ---------------------------------------------------------------------------

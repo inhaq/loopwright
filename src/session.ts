@@ -1,9 +1,19 @@
+import { randomUUID } from "node:crypto";
 import type { LoopwrightConfig } from "./config.js";
 import type { TaskSpec } from "./schemas/plan.js";
+import type { TaskState } from "./domain/stateMachine.js";
 import type { Finding } from "./schemas/critic.js";
 import { createRoles, type CreateRolesOptions } from "./adapters/roleBindings.js";
-import { runPlanReview, runTask, type PlanOutcome, type TaskOutcome } from "./engine/loop.js";
+import {
+  runPlanReview,
+  runTask,
+  type LoopObserver,
+  type PlanOutcome,
+  type TaskOutcome,
+} from "./engine/loop.js";
 import type { CommandExecutor } from "./engine/mechanicalGate.js";
+import type { Store } from "./storage/store.js";
+import { storeObserver, combineObservers } from "./storage/checkpoint.js";
 
 /**
  * End-to-end run (Task 15): goal -> reviewed plan -> per-task actor-critic loop
@@ -17,12 +27,12 @@ import type { CommandExecutor } from "./engine/mechanicalGate.js";
  * entrypoint.
  */
 
-export type SessionTaskStatus = "completed" | "skipped";
+export type SessionTaskStatus = "completed" | "skipped" | "resumed";
 
 export interface SessionTaskResult {
   taskId: string;
   status: SessionTaskStatus;
-  /** present when status === "completed" */
+  /** present when status is "completed" or "resumed" */
   outcome?: TaskOutcome;
   /** dependency ids that prevented this task from running (status === "skipped") */
   blockedBy?: string[];
@@ -30,6 +40,8 @@ export interface SessionTaskResult {
 
 export interface SessionResult {
   goal: string;
+  /** present when a store was provided; the id to resume with */
+  sessionId?: string;
   plan: PlanOutcome;
   results: SessionTaskResult[];
   /** task ids by terminal outcome (declared order) */
@@ -44,14 +56,23 @@ export interface SessionResult {
 export interface RunGoalOptions extends CreateRolesOptions {
   /** injectable mechanical-gate command runner (defaults to real subprocess) */
   executor?: CommandExecutor;
+  /** persistence; when set, transitions/attempts/outcomes are checkpointed */
+  store?: Store;
+  /** resume an existing session id (with `store`); reuses completed tasks */
+  sessionId?: string;
+  /** when true (with `store`), skip tasks already completed (GREEN/unverified) */
+  resume?: boolean;
+  /** extra observer composed with the store checkpointer (e.g. event log) */
+  observer?: LoopObserver;
 }
 
 /** Terminal task states that allow dependents to proceed (see scheduler, M4). */
+function isUnblockingState(state: TaskState): boolean {
+  return state === "GREEN" || state === "UNVERIFIED_BY_CRITIC";
+}
+
 function isUnblocking(outcome: TaskOutcome | undefined): boolean {
-  return (
-    outcome !== undefined &&
-    (outcome.finalState === "GREEN" || outcome.finalState === "UNVERIFIED_BY_CRITIC")
-  );
+  return outcome !== undefined && isUnblockingState(outcome.finalState);
 }
 
 /** Orders tasks so dependencies precede dependents (stable; rejects cycles). */
@@ -87,10 +108,33 @@ export async function runGoal(
   config: LoopwrightConfig,
   opts: RunGoalOptions = {},
 ): Promise<SessionResult> {
-  const { executor, ...roleOpts } = opts;
+  const { executor, store, sessionId: sessionIdOpt, resume, observer: extraObserver, ...roleOpts } =
+    opts;
   const { actor, critic } = createRoles(config, roleOpts);
-
   const cwd = opts.cwd ?? ".";
+
+  // Session bootstrap (only when persisting). A new id is minted if none given.
+  const sessionId = sessionIdOpt ?? (store ? randomUUID() : undefined);
+  if (store && sessionId) {
+    const existing = await store.getSession(sessionId);
+    const now = new Date().toISOString();
+    if (!existing) {
+      await store.createSession({ id: sessionId, goal, createdAt: now, updatedAt: now, status: "running" });
+    } else {
+      await store.updateSession(sessionId, { status: "running" });
+    }
+  }
+
+  // Checkpoint to the store and (optionally) fan out to a caller-supplied
+  // observer such as an event log. Absent both, the loop runs unobserved.
+  const observer =
+    (store && sessionId) || extraObserver
+      ? combineObservers(
+          store && sessionId ? storeObserver(store, sessionId) : undefined,
+          extraObserver,
+        )
+      : undefined;
+
   const baseDeps = {
     actor,
     critic,
@@ -98,14 +142,33 @@ export async function runGoal(
     cwd,
     ...(executor ? { executor } : {}),
     ...(opts.log ? { log: opts.log } : {}),
+    ...(observer ? { observer } : {}),
   };
 
   const plan = await runPlanReview(goal, baseDeps);
+  if (store && sessionId) {
+    await store.updateSession(sessionId, {
+      planApproved: plan.approved,
+      planRevisions: plan.revisions,
+    });
+  }
 
   const outcomes = new Map<string, TaskOutcome>();
   const results: SessionTaskResult[] = [];
 
   for (const task of dependencyOrder(plan.plan.tasks)) {
+    // Resume: a task already completed (GREEN/unverified) in a prior run is
+    // reused as-is, so an interrupted run doesn't repeat finished work.
+    if (resume && store && sessionId) {
+      const prior = await store.getOutcome(sessionId, task.id);
+      if (prior && isUnblockingState(prior.finalState)) {
+        outcomes.set(task.id, prior.outcome);
+        results.push({ taskId: task.id, status: "resumed", outcome: prior.outcome });
+        opts.log?.(`[${task.id}] RESUMED -- ${prior.finalState} (skipped rebuild)`);
+        continue;
+      }
+    }
+
     const blockedBy = task.dependencies.filter((d) => !isUnblocking(outcomes.get(d)));
     if (blockedBy.length > 0) {
       results.push({ taskId: task.id, status: "skipped", blockedBy });
@@ -134,8 +197,15 @@ export async function runGoal(
     else needsHuman.push(r.taskId);
   }
 
+  if (store && sessionId) {
+    await store.updateSession(sessionId, {
+      status: needsHuman.length > 0 ? "needs_human" : "completed",
+    });
+  }
+
   return {
     goal,
+    ...(sessionId ? { sessionId } : {}),
     plan,
     results: ordered,
     green,
