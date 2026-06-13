@@ -15,6 +15,8 @@ import type { IntegrationBranch } from "./engine/integrator.js";
 import type { CommandExecutor } from "./engine/mechanicalGate.js";
 import type { Store } from "./storage/store.js";
 import { storeObserver, combineObservers } from "./storage/checkpoint.js";
+import type { RunnerCallSink } from "./observability/instrument.js";
+import { EVENT_TYPES } from "./observability/events.js";
 
 /**
  * End-to-end run (Task 15): goal -> reviewed plan -> per-task actor-critic loop
@@ -95,10 +97,10 @@ export async function runGoal(
     repoDir,
     ...roleOpts
   } = opts;
-  const { actor, critic } = createRoles(config, roleOpts);
   const cwd = opts.cwd ?? ".";
 
-  // Session bootstrap (only when persisting). A new id is minted if none given.
+  // Session bootstrap (only when persisting). The id is computed first so every
+  // event — including runner calls — can be attributed to it.
   const sessionId = sessionIdOpt ?? (store ? randomUUID() : undefined);
   if (store && sessionId) {
     const existing = await store.getSession(sessionId);
@@ -108,7 +110,30 @@ export async function runGoal(
     } else {
       await store.updateSession(sessionId, { status: "running" });
     }
+    await store.recordEvent({
+      sessionId,
+      at: now,
+      type: EVENT_TYPES.sessionStarted,
+      data: { goal },
+    });
   }
+
+  // Roles, instrumented so every runner invocation emits a structured event
+  // (Task 22). When persisting, calls are recorded to the store's event stream.
+  const onRunnerCall: RunnerCallSink | undefined =
+    store && sessionId
+      ? (e) =>
+          store.recordEvent({
+            sessionId,
+            at: e.at,
+            type: EVENT_TYPES.runnerCall,
+            data: e as unknown as Record<string, unknown>,
+          })
+      : roleOpts.onRunnerCall;
+  const { actor, critic } = createRoles(config, {
+    ...roleOpts,
+    ...(onRunnerCall ? { onRunnerCall } : {}),
+  });
 
   // Checkpoint to the store and (optionally) fan out to a caller-supplied
   // observer such as an event log. Absent both, the loop runs unobserved.
@@ -135,6 +160,12 @@ export async function runGoal(
     await store.updateSession(sessionId, {
       planApproved: plan.approved,
       planRevisions: plan.revisions,
+    });
+    await store.recordEvent({
+      sessionId,
+      at: new Date().toISOString(),
+      type: EVENT_TYPES.planReviewed,
+      data: { approved: plan.approved, revisions: plan.revisions, openItems: plan.openItems.length },
     });
   }
 
@@ -191,6 +222,18 @@ export async function runGoal(
   if (store && sessionId) {
     await store.updateSession(sessionId, {
       status: needsHuman.length > 0 ? "needs_human" : "completed",
+    });
+    await store.recordEvent({
+      sessionId,
+      at: new Date().toISOString(),
+      type: EVENT_TYPES.sessionFinished,
+      data: {
+        green,
+        unverified,
+        needsHuman,
+        skipped,
+        allVerified: green.length === plan.plan.tasks.length,
+      },
     });
   }
 

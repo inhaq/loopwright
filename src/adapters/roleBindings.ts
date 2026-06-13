@@ -4,6 +4,7 @@ import { createRunner, type RunnerFactory } from "../runners/runnerFactory.js";
 import type { Actor, Critic } from "./agents.js";
 import { RunnerActor, RunnerCritic } from "./runnerRoles.js";
 import type { ActorPromptTemplates, CriticPromptTemplates } from "./prompts.js";
+import { instrumentRunner, type RunnerCallSink } from "../observability/instrument.js";
 
 /**
  * Configuration -> roles wiring (Task 13.3).
@@ -35,6 +36,8 @@ export interface CreateRolesOptions {
   /** workspace the runners operate in (single dir until worktrees, Milestone 4) */
   cwd?: string;
   log?: (line: string) => void;
+  /** when set, every runner call emits an event attributed to its role (M5) */
+  onRunnerCall?: RunnerCallSink;
 }
 
 function resolveProfile(
@@ -80,13 +83,22 @@ export function createRoles(
   const actorProfile = resolveProfile(profiles, "actor", config.actorRunner, config.actorModel);
   const criticProfile = resolveProfile(profiles, "critic", config.criticRunner, config.criticModel);
 
-  const actor = new RunnerActor(factory(actorProfile), {
+  const actorRunner = factory(actorProfile);
+  const criticRunner = factory(criticProfile);
+  const instrumentedActor = opts.onRunnerCall
+    ? instrumentRunner(actorRunner, "actor", opts.onRunnerCall)
+    : actorRunner;
+  const instrumentedCritic = opts.onRunnerCall
+    ? instrumentRunner(criticRunner, "critic", opts.onRunnerCall)
+    : criticRunner;
+
+  const actor = new RunnerActor(instrumentedActor, {
     ...(opts.actorPrompts ? { prompts: opts.actorPrompts } : {}),
     ...(opts.cwd ? { cwd: opts.cwd } : {}),
     ...(opts.log ? { log: opts.log } : {}),
   });
 
-  const critic = new RunnerCritic(factory(criticProfile), {
+  const critic = new RunnerCritic(instrumentedCritic, {
     ...(opts.criticPrompts ? { prompts: opts.criticPrompts } : {}),
     ...(opts.cwd ? { cwd: opts.cwd } : {}),
     ...(opts.log ? { log: opts.log } : {}),
