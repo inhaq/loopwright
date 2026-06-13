@@ -25,8 +25,16 @@ async function main(): Promise<void> {
   let resumeId: string | undefined;
   const resumeIdx = args.indexOf("--resume");
   if (resumeIdx !== -1) {
-    resumeId = args[resumeIdx + 1];
-    args.splice(resumeIdx, resumeId ? 2 : 1);
+    const next = args[resumeIdx + 1];
+    // `--resume` with no following session id (or another flag) is a user error,
+    // not a silent no-op: bail out so it can't be quietly ignored and start a
+    // brand-new session instead of resuming.
+    if (next === undefined || next.startsWith("-")) {
+      console.error("Error: --resume requires a <sessionId>");
+      process.exit(2);
+    }
+    resumeId = next;
+    args.splice(resumeIdx, 2);
   }
   const goal = args.join(" ").trim();
   if (!goal) {

@@ -236,12 +236,19 @@ export class JsonFileStore extends BaseStore {
   protected persist(): Promise<void> {
     const snapshot = JSON.stringify(this.db);
     const tmp = `${this.filePath}.tmp`;
-    this.writeChain = this.writeChain.then(async () => {
+    // Chain writes so parallel mutations can't interleave a half-written file.
+    // Crucially, recover from a prior failure first: without this, a single
+    // failed write (e.g. ENOSPC) would leave writeChain permanently rejected
+    // and every later persist() would short-circuit, silently dropping all
+    // future checkpoints. We swallow only the *previous* error here; this
+    // call's own result is still surfaced to its caller.
+    const result = this.writeChain.catch(() => {}).then(async () => {
       await mkdir(path.dirname(this.filePath), { recursive: true });
       await writeFile(tmp, snapshot, "utf8");
       await rename(tmp, this.filePath);
     });
-    return this.writeChain;
+    this.writeChain = result;
+    return result;
   }
 }
 
