@@ -24,10 +24,10 @@ const RULES: RedactionRule[] = [
     pattern: /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g,
     replace: () => REDACTED,
   },
-  // Bearer tokens in headers
+  // Bearer tokens in headers (any casing: "Bearer", "bearer", "BEARER")
   {
     name: "bearer",
-    pattern: /\bBearer\s+[A-Za-z0-9._-]{8,}/g,
+    pattern: /\bBearer\s+[A-Za-z0-9._-]{8,}/gi,
     replace: () => `Bearer ${REDACTED}`,
   },
   // AWS access key ids
@@ -62,6 +62,12 @@ const RULES: RedactionRule[] = [
     name: "home-path",
     pattern: /\/(Users|home)\/[^/\s:"']+/g,
     replace: (_m, root: string) => `/${root}/[user]`,
+  },
+  // Windows home paths, e.g. C:\Users\Alice\... -> C:\Users\[user]\...
+  {
+    name: "windows-home-path",
+    pattern: /([A-Za-z]:\\Users\\)[^\\\s:"']+/g,
+    replace: (_m, prefix: string) => `${prefix}[user]`,
   },
 ];
 

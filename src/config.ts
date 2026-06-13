@@ -16,6 +16,20 @@ export type CriticFallback = z.infer<typeof CriticFallbackSchema>;
 
 const ENV_PREFIX = "LOOPWRIGHT_";
 
+/**
+ * Env-string boolean. `z.coerce.boolean()` is unsafe here: it uses JS
+ * `Boolean(str)`, so "false"/"0" (non-empty strings) coerce to `true`, which
+ * would make boolean toggles impossible to disable via env. This maps common
+ * truthy/falsy spellings explicitly and leaves real booleans untouched.
+ */
+const EnvBoolean = z.preprocess((v) => {
+  if (typeof v !== "string") return v;
+  const n = v.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(n)) return true;
+  if (["0", "false", "no", "off"].includes(n)) return false;
+  return v; // anything else falls through to z.boolean() validation
+}, z.boolean());
+
 function defaultDbPath(): string {
   return path.join(
     os.homedir(),
@@ -38,13 +52,13 @@ const RawConfigSchema = z.object({
   /** how many times the actor may re-attempt after a mechanical-gate failure */
   mechanicalFixMax: z.coerce.number().int().min(1).default(3),
 
-  mechanicalGate: z.coerce.boolean().default(true),
+  mechanicalGate: EnvBoolean.default(true),
   criticFallback: CriticFallbackSchema.default("actor_self_review"),
 
   // execution
   maxParallel: z.coerce.number().int().min(1).default(2),
   stuckThresholdMs: z.coerce.number().int().min(1000).default(120_000),
-  useWorktrees: z.coerce.boolean().default(true),
+  useWorktrees: EnvBoolean.default(true),
 
   dbPath: z.string().default(defaultDbPath()),
 });

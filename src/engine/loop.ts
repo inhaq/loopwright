@@ -89,11 +89,14 @@ async function fallbackUnavailable(
   if (deps.config.criticFallback === "pause") {
     return { kind: "paused", reason: "Critic unavailable (quota) and fallback=pause." };
   }
-  // actor_self_review: best-effort, clearly marked as NOT a real critic pass.
+  // opus/actor self-review: best-effort, clearly marked as NOT a real critic pass.
   try {
     const resp = await deps.actor.selfReview(bundle);
     const parsed = parseCriticResponse(resp.text);
-    const notes = parsed.ok ? normalizeReview(parsed.review).review.findings : [];
+    // Only carry NON-blocking findings forward: in the degraded path these
+    // become informational nits, and a blocker mislabeled as a nit would be
+    // misleading (the result is already surfaced as UNVERIFIED_BY_CRITIC).
+    const notes = parsed.ok ? nitsOf(normalizeReview(parsed.review).review) : [];
     return {
       kind: "unavailable",
       selfReviewNotes: notes,

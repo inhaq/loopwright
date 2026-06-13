@@ -74,3 +74,22 @@ describe("normalizeReview (rubric enforcement)", () => {
     expect(out.verdict).toBe("green");
   });
 });
+
+
+describe("parseCriticResponse robustness", () => {
+  it("ignores an earlier non-JSON brace and uses the valid JSON later", () => {
+    const raw = 'I might do {something here} first. Final: {"verdict":"green","findings":[]}';
+    const r = parseCriticResponse(raw);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.review.verdict).toBe("green");
+  });
+
+  it("prefers the last valid JSON object when several are present", () => {
+    const raw =
+      'Draft: {"verdict":"green","findings":[]} ... revised: ' +
+      '{"verdict":"changes_required","findings":[{"severity":"blocker","category":"correctness","detail":"x","location":""}]}';
+    const r = parseCriticResponse(raw);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.review.verdict).toBe("changes_required");
+  });
+});
