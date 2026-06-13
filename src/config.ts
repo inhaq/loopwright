@@ -1,6 +1,7 @@
 import { z } from "zod";
 import os from "node:os";
 import path from "node:path";
+import { RunnerProfileSchema } from "./runners/agentRunner.js";
 
 /**
  * Loopwright (actor-critic) configuration. Validated with zod so a bad env
@@ -40,11 +41,35 @@ function defaultDbPath(): string {
   );
 }
 
+/**
+ * Runner profiles supplied as a JSON array string (env-friendly), e.g.
+ * `LOOPWRIGHT_RUNNERS='[{"id":"primary","kind":"cli","model":"m","options":{...}}]'`.
+ * An empty/blank value means "no profiles"; anything that isn't valid JSON falls
+ * through to array validation so the failure is explicit rather than silent.
+ */
+const RunnerProfilesEnv = z.preprocess((v) => {
+  if (typeof v !== "string") return v;
+  const s = v.trim();
+  if (s === "") return [];
+  try {
+    return JSON.parse(s);
+  } catch {
+    return v; // not an array -> clear zod error below
+  }
+}, z.array(RunnerProfileSchema).default([]));
+
 const RawConfigSchema = z.object({
   // role -> runner binding. These reference runner-profile ids / model strings;
   // there is no vendor default so nothing is locked to a specific provider.
   actorModel: z.string().default(""),
   criticModel: z.string().default(""),
+
+  // runner profiles + which profile backs each role (see adapters/roleBindings)
+  runners: RunnerProfilesEnv,
+  /** id of the runner profile that backs the actor role */
+  actorRunner: z.string().default(""),
+  /** id of the runner profile that backs the critic role */
+  criticRunner: z.string().default(""),
 
   // loop caps
   planReviewMax: z.coerce.number().int().min(0).default(2),
@@ -72,6 +97,9 @@ export function loadConfig(
   return RawConfigSchema.parse({
     actorModel: env[`${ENV_PREFIX}ACTOR_MODEL`],
     criticModel: env[`${ENV_PREFIX}CRITIC_MODEL`],
+    runners: env[`${ENV_PREFIX}RUNNERS`],
+    actorRunner: env[`${ENV_PREFIX}ACTOR_RUNNER`],
+    criticRunner: env[`${ENV_PREFIX}CRITIC_RUNNER`],
     planReviewMax: env[`${ENV_PREFIX}PLAN_REVIEW_MAX`],
     taskReviewCyclesMax: env[`${ENV_PREFIX}TASK_REVIEW_CYCLES_MAX`],
     mechanicalFixMax: env[`${ENV_PREFIX}MECHANICAL_FIX_MAX`],
