@@ -11,6 +11,8 @@
     "demo": "tsx src/demo.ts",
     "start": "tsx src/run.ts",
     "trace": "tsx src/trace.ts",
+    "serve": "tsx src/server/index.ts",
+    "build:sidecar": "node scripts/build-sidecar.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

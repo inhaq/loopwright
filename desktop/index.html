@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Loopwright</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">Loopwright</div>
+        <nav>
+          <button data-nav="start" class="active">New run</button>
+          <button data-nav="sessions">Sessions</button>
+          <button data-nav="secrets" id="nav-secrets" hidden>Secrets</button>
+        </nav>
+        <div id="engine-status" class="engine-status" title="engine connection">connecting…</div>
+      </header>
+      <main id="view"></main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
