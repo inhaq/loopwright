@@ -14,8 +14,13 @@ use std::path::PathBuf;
 use keyring::Entry;
 use tauri::{AppHandle, Manager};
 
-/// Keychain service namespace for all Loopwright secrets.
-const SERVICE: &str = "dev.loopwright.desktop";
+/// Keychain service namespace for all Loopwright secrets, derived from the app
+/// bundle identifier so it always matches the app's identity (and stays correct
+/// if the identifier changes for a production release) rather than being a
+/// second hardcoded copy of the namespace.
+fn service(app: &AppHandle) -> String {
+    app.config().identifier.clone()
+}
 
 fn index_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
@@ -71,7 +76,7 @@ pub fn list_keys(app: &AppHandle) -> Result<Vec<String>, String> {
 /// Stores (or replaces) a secret in the keychain and records its name.
 pub fn set(app: &AppHandle, key: &str, value: &str) -> Result<(), String> {
     validate_key(key)?;
-    let entry = Entry::new(SERVICE, key).map_err(|e| e.to_string())?;
+    let entry = Entry::new(&service(app), key).map_err(|e| e.to_string())?;
     entry.set_password(value).map_err(|e| e.to_string())?;
     let mut keys = read_index(app)?;
     if !keys.iter().any(|k| k == key) {
@@ -83,7 +88,7 @@ pub fn set(app: &AppHandle, key: &str, value: &str) -> Result<(), String> {
 
 /// Removes a secret from the keychain and the index. Idempotent.
 pub fn delete(app: &AppHandle, key: &str) -> Result<(), String> {
-    if let Ok(entry) = Entry::new(SERVICE, key) {
+    if let Ok(entry) = Entry::new(&service(app), key) {
         // Ignore "no such entry" so repeated deletes don't error.
         let _ = entry.delete_credential();
     }
@@ -96,8 +101,9 @@ pub fn delete(app: &AppHandle, key: &str) -> Result<(), String> {
 /// Names whose keychain value has gone missing are silently skipped.
 pub fn all(app: &AppHandle) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
+    let svc = service(app);
     for key in read_index(app)? {
-        if let Ok(entry) = Entry::new(SERVICE, &key) {
+        if let Ok(entry) = Entry::new(&svc, &key) {
             if let Ok(value) = entry.get_password() {
                 out.push((key, value));
             }

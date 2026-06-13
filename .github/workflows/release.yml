@@ -3,9 +3,12 @@ name: Release
 # Publishes desktop installers to a GitHub Release. Triggered by pushing a
 # version tag (e.g. v0.1.0); `workflow_dispatch` allows a manual draft build.
 #
-# Code signing / notarization and updater signing are wired through the env
-# block below and activate automatically once the corresponding repository
-# secrets are configured — until then the workflow still builds and uploads
+# A `gate` job runs the full quality suite (typecheck, tests, audits, cargo
+# test) and, for tag builds, verifies the tag matches every manifest version
+# BEFORE anything is published — so a bad tagged commit cannot produce a
+# release. Code signing / notarization and updater signing are wired through
+# the publish job's env block and activate automatically once the corresponding
+# repository secrets are configured; until then the workflow still uploads
 # unsigned installers as a draft release for QA. See the notes at the bottom.
 on:
   push:
@@ -20,8 +23,111 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Quality gate: must pass before any artifact is built or published.
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Fail fast (before the expensive toolchain/build steps) if a tag does not
+      # match the versions committed to every manifest.
+      - name: Verify tag matches manifest versions
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$tag" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag '${GITHUB_REF_NAME}' is not a vX.Y.Z release tag"
+            exit 1
+          fi
+          root=$(node -p "require('./package.json').version")
+          desk=$(node -p "require('./desktop/package.json').version")
+          conf=$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")
+          cargo=$(grep -m1 -E '^version *= *"' desktop/src-tauri/Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
+          fail=0
+          for pair in "root package.json:${root}" "desktop/package.json:${desk}" "tauri.conf.json:${conf}" "Cargo.toml:${cargo}"; do
+            name="${pair%%:*}"; ver="${pair##*:}"
+            if [ "${ver}" != "${tag}" ]; then
+              echo "::error::${name} version '${ver}' does not match tag '${tag}'"
+              fail=1
+            fi
+          done
+          if [ "${fail}" -ne 0 ]; then
+            echo "Bump every manifest to ${tag} before tagging the release."
+            exit 1
+          fi
+          echo "All manifests match ${tag}."
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.14
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libssl-dev \
+            libsecret-1-dev \
+            patchelf \
+            file \
+            build-essential
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: desktop
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Audit root dependencies
+        run: npm audit --audit-level=moderate
+
+      - name: Audit desktop dependencies
+        run: npm audit --audit-level=high
+        working-directory: desktop
+
+      - name: Build engine sidecar
+        run: npm run build:sidecar
+        working-directory: desktop
+
+      - name: Build desktop frontend
+        run: npm run build
+        working-directory: desktop
+
+      - name: Cargo test
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked
+
   release:
     name: release (${{ matrix.os }})
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       # Build every platform even if one fails, so a single platform issue does
@@ -117,6 +223,7 @@ jobs:
 #     to sign + notarize. Windows: configure a code-signing cert in tauri.conf
 #     (bundle.windows.certificateThumbprint or a signCommand) + secret.
 #   - Confirm the bundle identifier (currently dev.loopwright.desktop) maps to a
-#     domain the org controls before first public release.
+#     domain the org controls before first public release. The keychain service
+#     namespace follows the identifier automatically (see secrets.rs).
 #   - Auto-update: add the tauri updater plugin + endpoints and a signing key
 #     (TAURI_SIGNING_PRIVATE_KEY) to ship update artifacts.
