@@ -254,9 +254,11 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     }
 
     // Health is intentionally unauthenticated (no sensitive data) so the UI can
-    // show connectivity before it has resolved the token.
+    // show connectivity before it has resolved the token. `activeRuns` lets the
+    // desktop shell warn before a restart that would abort in-flight runs; it's
+    // a process-scoped count, not session data, so it's safe to expose here.
     if (pathname === "/api/health") {
-      return send(res, 200, { ok: true }, cors);
+      return send(res, 200, { ok: true, activeRuns }, cors);
     }
 
     // Everything else under /api requires the token. This is the boundary that

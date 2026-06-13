@@ -15,8 +15,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Least privilege: default the whole workflow to read-only so a compromised
+# dependency install script or test step in the gate cannot mutate the repo.
+# Only the publish job is granted contents: write (to create the Release).
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -29,6 +32,9 @@ jobs:
   # checks (tag/version match, dependency audits) run on Linux only.
   gate:
     name: gate (${{ matrix.os }})
+    # Read-only: this job runs npm ci / tests and must never need write scope.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +43,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Don't leave the GITHUB_TOKEN in .git/config where the subsequent
+          # `npm ci` / test steps (and their dependency scripts) could read it.
+          persist-credentials: false
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v4
@@ -141,6 +151,11 @@ jobs:
   release:
     name: release (${{ matrix.os }})
     needs: gate
+    # The only job that needs write scope — it creates/uploads the GitHub
+    # Release. tauri-action authenticates via the GITHUB_TOKEN env var below,
+    # not persisted git credentials, so the checkout stays credential-free.
+    permissions:
+      contents: write
     runs-on: ${{ matrix.os }}
     strategy:
       # Build every platform even if one fails, so a single platform issue does
@@ -160,6 +175,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v4

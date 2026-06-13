@@ -96,6 +96,10 @@ button.small { font-size: 12px; padding: 3px 8px; }
 .hint.error, .error { color: var(--red); }
 .hint.pending { color: var(--yellow); }
 
+/* Inline confirmation shown before a restart that would abort active runs. */
+.confirm-restart { margin-top: 10px; }
+.confirm-restart .warn { color: var(--yellow); font-size: 13px; margin-bottom: 6px; }
+
 .goal { font-size: 15px; margin-bottom: 4px; }
 .session-id { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-bottom: 10px; }
 

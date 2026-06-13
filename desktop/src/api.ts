@@ -118,6 +118,21 @@ export async function health(): Promise<boolean> {
 }
 
 /**
+ * Number of runs currently executing inside the engine process. Used to warn
+ * before a restart (which re-spawns the sidecar and aborts in-flight runs).
+ * Returns 0 if the engine can't be reached — the caller treats "unknown" as
+ * "nothing to lose" so a transient blip never blocks applying new secrets.
+ */
+export async function activeRunCount(): Promise<number> {
+  try {
+    const { activeRuns } = await getJson<{ ok: boolean; activeRuns?: number }>("/api/health");
+    return typeof activeRuns === "number" && activeRuns > 0 ? activeRuns : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Subscribes to a run's live event stream. Returns a function that closes it.
  * Uses the native EventSource, which transparently reconnects and replays via
  * Last-Event-ID; the server's hub honours that header to avoid duplicates.

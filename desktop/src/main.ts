@@ -1,6 +1,7 @@
 import "./styles.css";
 import {
   apiBase,
+  activeRunCount,
   cancelRun,
   deleteSecret,
   getTrace,
@@ -517,7 +518,14 @@ async function renderSecrets(): Promise<void> {
   card.append(form, formError);
 
   const restart = h("button", {}, ["Restart engine to apply secret changes"]);
-  restart.addEventListener("click", async () => {
+  // A restart re-spawns the sidecar (backend restart = shutdown + start), which
+  // ABORTS any in-flight runs. Guard it: if runs are active, require an explicit
+  // confirmation naming how many will be cancelled rather than silently killing
+  // them. The confirm prompt lives inline (Tauri intercepts window.confirm).
+  const confirmPanel = h("div", { class: "confirm-restart", hidden: "true" });
+
+  async function performRestart(): Promise<void> {
+    confirmPanel.hidden = true;
     restart.textContent = "Restarting…";
     restart.setAttribute("disabled", "true");
     try {
@@ -531,8 +539,47 @@ async function renderSecrets(): Promise<void> {
       restart.textContent = "Restart engine to apply secret changes";
       restart.removeAttribute("disabled");
     }
+  }
+
+  function askRestartConfirm(active: number): void {
+    confirmPanel.innerHTML = "";
+    const runWord = active === 1 ? "run is" : "runs are";
+    const itWord = active === 1 ? "it" : "them";
+    const proceed = h("button", { class: "danger" }, [
+      `Cancel ${active} run${active === 1 ? "" : "s"} & restart`,
+    ]);
+    proceed.addEventListener("click", () => void performRestart());
+    const keep = h("button", {}, ["Keep runs going"]);
+    keep.addEventListener("click", () => {
+      confirmPanel.hidden = true;
+    });
+    confirmPanel.append(
+      h("div", { class: "warn" }, [
+        `${active} ${runWord} still active. Restarting will abort ${itWord}.`,
+      ]),
+      h("div", { class: "actions" }, [proceed, keep]),
+    );
+    confirmPanel.hidden = false;
+  }
+
+  restart.addEventListener("click", async () => {
+    formError.hidden = true;
+    confirmPanel.hidden = true;
+    restart.setAttribute("disabled", "true");
+    let active = 0;
+    try {
+      active = await activeRunCount();
+    } catch {
+      /* unknown — fall through and restart (treat as nothing to lose) */
+    }
+    restart.removeAttribute("disabled");
+    if (active > 0) {
+      askRestartConfirm(active);
+      return;
+    }
+    await performRestart();
   });
-  card.append(h("div", { class: "actions" }, [restart, pending]));
+  card.append(h("div", { class: "actions" }, [restart, pending]), confirmPanel);
 
   await refresh();
 }
