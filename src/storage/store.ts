@@ -73,6 +73,20 @@ export interface OutcomeRecord {
   outcome: TaskOutcome;
 }
 
+/**
+ * A generic structured event (Milestone 5). Transitions/attempts/outcomes have
+ * their own typed tables; this stream captures everything else needed for a
+ * full trace — most importantly runner invocations — plus session lifecycle
+ * markers. `type` discriminates; `data` is the type-specific payload.
+ */
+export interface EventRecord {
+  seq: number;
+  sessionId: string;
+  at: string;
+  type: string;
+  data: Record<string, unknown>;
+}
+
 export interface Store {
   createSession(rec: SessionRecord): Promise<void>;
   updateSession(id: string, patch: Partial<Omit<SessionRecord, "id">>): Promise<void>;
@@ -89,6 +103,9 @@ export interface Store {
   getOutcome(sessionId: string, taskId: string): Promise<OutcomeRecord | undefined>;
   listTransitions(sessionId: string): Promise<TransitionRecord[]>;
   listAttempts(sessionId: string): Promise<AttemptRecord[]>;
+
+  recordEvent(rec: Omit<EventRecord, "seq">): Promise<void>;
+  listEvents(sessionId: string): Promise<EventRecord[]>;
 }
 
 interface Db {
@@ -99,10 +116,20 @@ interface Db {
   outcomes: Record<string, OutcomeRecord>; // key: `${sessionId}\u0000${taskId}`
   transitions: TransitionRecord[];
   attempts: AttemptRecord[];
+  events: EventRecord[];
 }
 
 function emptyDb(): Db {
-  return { version: 1, seq: 0, sessions: {}, tasks: {}, outcomes: {}, transitions: [], attempts: [] };
+  return {
+    version: 1,
+    seq: 0,
+    sessions: {},
+    tasks: {},
+    outcomes: {},
+    transitions: [],
+    attempts: [],
+    events: [],
+  };
 }
 
 const key = (sessionId: string, taskId: string): string => `${sessionId}\u0000${taskId}`;
@@ -195,6 +222,16 @@ abstract class BaseStore implements Store {
 
   async listAttempts(sessionId: string): Promise<AttemptRecord[]> {
     return this.db.attempts.filter((a) => a.sessionId === sessionId).map((a) => ({ ...a }));
+  }
+
+  async recordEvent(rec: Omit<EventRecord, "seq">): Promise<void> {
+    const seq = ++this.db.seq;
+    this.db.events.push({ ...rec, seq });
+    await this.persist();
+  }
+
+  async listEvents(sessionId: string): Promise<EventRecord[]> {
+    return this.db.events.filter((e) => e.sessionId === sessionId).map((e) => ({ ...e }));
   }
 }
 

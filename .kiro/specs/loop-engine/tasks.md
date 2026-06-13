@@ -57,9 +57,9 @@ Each task references the requirement(s) it satisfies.
 
 ## Milestone 5 — Observability
 
-- [ ] 22. Structured event log for transitions and runner calls _(Req 11)_
-- [ ] 23. Usage/cost ledger per role and per run _(Req 11)_
-- [ ] 24. Session trace inspection _(Req 11)_
+- [~] 22. Structured event log for transitions and runner calls _(Req 11)_
+- [~] 23. Usage/cost ledger per role and per run _(Req 11)_
+- [~] 24. Session trace inspection _(Req 11)_
 
 ## Milestone 6 — Desktop delivery
 
