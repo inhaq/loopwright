@@ -9,6 +9,7 @@ import type {
   RunnerProfile,
 } from "./agentRunner.js";
 import { redactAndTruncate } from "../engine/redaction.js";
+import { killProcessTree, detachForTreeKill } from "../engine/processTree.js";
 
 /**
  * Generic, vendor-neutral runner that drives a headless command-line agent as a
@@ -187,7 +188,12 @@ export class CliRunner implements AgentRunner {
     const { command, promptVia, timeoutMs, maxCapturedChars } = this.opts;
     return new Promise((resolve) => {
       const started = Date.now();
-      const child = spawn(command, args, { cwd: req.cwd, env, shell: false });
+      const child = spawn(command, args, {
+        cwd: req.cwd,
+        env,
+        shell: false,
+        detached: detachForTreeKill,
+      });
 
       let stdout = "";
       let stderr = "";
@@ -204,7 +210,7 @@ export class CliRunner implements AgentRunner {
 
       const timer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGKILL");
+        killProcessTree(child);
       }, timeoutMs);
 
       child.on("error", (err) => {

@@ -4,6 +4,7 @@ import {
   type MechanicalStepResult,
 } from "../schemas/artifact.js";
 import { redactAndTruncate } from "./redaction.js";
+import { killProcessTree, detachForTreeKill } from "./processTree.js";
 
 /**
  * Runs a task's verify commands (build/test/lint) as the cheap, deterministic
@@ -52,7 +53,7 @@ export function createShellExecutor(
   return (command, cwd) =>
     new Promise((resolve) => {
       const started = Date.now();
-      const child = spawn(command, { cwd, shell: true });
+      const child = spawn(command, { cwd, shell: true, detached: detachForTreeKill });
       let output = "";
       let timedOut = false;
 
@@ -63,7 +64,7 @@ export function createShellExecutor(
 
       const timer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGKILL");
+        killProcessTree(child);
       }, timeoutMs);
 
       child.stdout.on("data", append);
