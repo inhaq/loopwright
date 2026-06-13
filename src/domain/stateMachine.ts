@@ -29,6 +29,7 @@ export const TASK_EVENTS = [
   "CRITIC_UNAVAILABLE",
   "MALFORMED_GIVEUP",
   "EXCEEDED_LIMIT",
+  "STUCK_ABORTED",
 ] as const;
 
 export type TaskEvent = (typeof TASK_EVENTS)[number];
@@ -47,10 +48,13 @@ const TRANSITIONS: Record<TaskState, Partial<Record<TaskEvent, TaskState>>> = {
   BUILDING: {
     MECHANICAL_PASSED: "CRITIC_REVIEWING",
     MECHANICAL_FAILED: "MECHANICAL_FAILED",
+    // watchdog abort: no progress within the configured threshold
+    STUCK_ABORTED: "NEEDS_HUMAN",
   },
   MECHANICAL_FAILED: {
     RETRY_BUILD: "BUILDING",
     EXCEEDED_LIMIT: "NEEDS_HUMAN",
+    STUCK_ABORTED: "NEEDS_HUMAN",
   },
   CRITIC_REVIEWING: {
     CRITIC_GREEN: "GREEN",
@@ -59,10 +63,12 @@ const TRANSITIONS: Record<TaskState, Partial<Record<TaskEvent, TaskState>>> = {
     MALFORMED_GIVEUP: "NEEDS_HUMAN",
     // review-cycle cap hit on the final cycle: stop directly from review
     EXCEEDED_LIMIT: "NEEDS_HUMAN",
+    STUCK_ABORTED: "NEEDS_HUMAN",
   },
   CHANGES_REQUIRED: {
     RETRY_BUILD: "BUILDING",
     EXCEEDED_LIMIT: "NEEDS_HUMAN",
+    STUCK_ABORTED: "NEEDS_HUMAN",
   },
   GREEN: {},
   NEEDS_HUMAN: {},

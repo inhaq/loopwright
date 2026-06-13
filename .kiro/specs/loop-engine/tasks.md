@@ -41,25 +41,25 @@ Each task references the requirement(s) it satisfies.
 
 ## Milestone 3 — Persistence and resilience
 
-- [ ] 16. Local store for sessions, tasks, attempts, transitions, outcomes
+- [~] 16. Local store for sessions, tasks, attempts, transitions, outcomes
   _(Req 10, 11)_
-- [ ] 17. Checkpoint on each transition; resume a run after interruption
+- [~] 17. Checkpoint on each transition; resume a run after interruption
   _(Req 10)_
-- [ ] 18. Stuck-detection watchdog (no-progress threshold) feeding the loop
+- [~] 18. Stuck-detection watchdog (no-progress threshold) feeding the loop
   _(Req 2, 5)_
 
 ## Milestone 4 — Parallel execution
 
-- [ ] 19. Dependency-graph scheduler honoring the parallelism limit _(Req 9)_
-- [ ] 20. Isolated workspaces (git worktrees) per concurrent task _(Req 9)_
-- [ ] 21. Integrator: merge completed work, run full verification, surface
+- [~] 19. Dependency-graph scheduler honoring the parallelism limit _(Req 9)_
+- [~] 20. Isolated workspaces (git worktrees) per concurrent task _(Req 9)_
+- [~] 21. Integrator: merge completed work, run full verification, surface
   conflicts _(Req 9)_
 
 ## Milestone 5 — Observability
 
-- [ ] 22. Structured event log for transitions and runner calls _(Req 11)_
-- [ ] 23. Usage/cost ledger per role and per run _(Req 11)_
-- [ ] 24. Session trace inspection _(Req 11)_
+- [~] 22. Structured event log for transitions and runner calls _(Req 11)_
+- [~] 23. Usage/cost ledger per role and per run _(Req 11)_
+- [~] 24. Session trace inspection _(Req 11)_
 
 ## Milestone 6 — Desktop delivery
 

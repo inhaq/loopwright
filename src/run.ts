@@ -10,25 +10,53 @@
  *   LOOPWRIGHT_ACTOR_RUNNER=primary
  *   LOOPWRIGHT_CRITIC_RUNNER=primary
  *
- * Run with: npm start -- "your goal here"
+ * Run with: npm start -- "your goal here" [--resume <sessionId>]
+ *
+ * Progress is checkpointed to the store at config.dbPath, so an interrupted run
+ * can be resumed by id without repeating completed tasks.
  */
 import { loadConfig } from "./config.js";
 import { runGoal, openBlockers } from "./session.js";
+import { openStore } from "./storage/store.js";
 
 async function main(): Promise<void> {
-  const goal = process.argv.slice(2).join(" ").trim();
+  const args = process.argv.slice(2);
+  // Optional: `--resume <sessionId>` to continue a previously interrupted run.
+  let resumeId: string | undefined;
+  const resumeIdx = args.indexOf("--resume");
+  if (resumeIdx !== -1) {
+    const next = args[resumeIdx + 1];
+    // `--resume` with no following session id (or another flag) is a user error,
+    // not a silent no-op: bail out so it can't be quietly ignored and start a
+    // brand-new session instead of resuming.
+    if (next === undefined || next.startsWith("-")) {
+      console.error("Error: --resume requires a <sessionId>");
+      process.exit(2);
+    }
+    resumeId = next;
+    args.splice(resumeIdx, 2);
+  }
+  const goal = args.join(" ").trim();
   if (!goal) {
-    console.error('Usage: npm start -- "your goal here"');
+    console.error('Usage: npm start -- "your goal here" [--resume <sessionId>]');
     process.exit(2);
   }
 
   const config = loadConfig();
+  const store = await openStore(config.dbPath);
   const log = (line: string) => console.log("   " + line);
 
   console.log(`\n=== GOAL: ${goal} ===\n`);
-  const result = await runGoal(goal, config, { log });
+  const result = await runGoal(goal, config, {
+    log,
+    store,
+    ...(resumeId ? { sessionId: resumeId, resume: true } : {}),
+  });
 
   console.log("\n=== SUMMARY ===");
+  if (result.sessionId) {
+    console.log(`session: ${result.sessionId}  (resume with: npm start -- "<goal>" --resume ${result.sessionId})`);
+  }
   console.log(
     `plan: approved=${result.plan.approved} revisions=${result.plan.revisions} ` +
       `openItems=${result.plan.openItems.length}`,
@@ -37,9 +65,11 @@ async function main(): Promise<void> {
     const badge =
       r.status === "skipped"
         ? `SKIPPED (blocked by ${r.blockedBy?.join(", ") ?? "?"})`
-        : r.outcome?.verified
-          ? "GREEN (verified)"
-          : (r.outcome?.finalState ?? "UNKNOWN");
+        : r.status === "resumed"
+          ? `RESUMED (${r.outcome?.finalState})`
+          : r.outcome?.verified
+            ? "GREEN (verified)"
+            : (r.outcome?.finalState ?? "UNKNOWN");
     console.log(`  ${r.taskId.padEnd(10)} ${badge}`);
   }
 
