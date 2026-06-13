@@ -49,7 +49,13 @@ describe("shell executor safeguards", () => {
 
   it("bounds captured output to the configured max", async () => {
     const exec = createShellExecutor({ maxCapturedChars: 100 });
-    const r = await exec("for i in $(seq 1 1000); do echo AAAAAAAAAA; done", ".");
+    // Use node itself (guaranteed present, cross-platform) to emit a lot of
+    // output rather than POSIX-only shell builtins like `seq`, which fail
+    // under cmd.exe on Windows.
+    const r = await exec(
+      `node -e "for(let i=0;i<1000;i++)console.log('AAAAAAAAAA')"`,
+      ".",
+    );
     expect(r.exitCode).toBe(0);
     expect(r.output.length).toBeLessThanOrEqual(100);
   }, 10_000);
