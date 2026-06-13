@@ -89,7 +89,7 @@ async function fallbackUnavailable(
   if (deps.config.criticFallback === "pause") {
     return { kind: "paused", reason: "Critic unavailable (quota) and fallback=pause." };
   }
-  // opus/actor self-review: best-effort, clearly marked as NOT a real critic pass.
+  // actor self-review: best-effort, clearly marked as NOT a real critic pass.
   try {
     const resp = await deps.actor.selfReview(bundle);
     const parsed = parseCriticResponse(resp.text);
