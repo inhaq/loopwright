@@ -131,6 +131,12 @@ jobs:
         run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked
 
       # Full release-path build: bundles the app for the host platform.
+      # APPIMAGE_EXTRACT_AND_RUN lets the AppImage bundling tools (linuxdeploy /
+      # appimagetool, themselves AppImages) run on GitHub runners, which lack
+      # FUSE; without it Linux AppImage bundling fails with "failed to run
+      # linuxdeploy". No-op on macOS/Windows.
       - name: Tauri build
         run: npm run tauri build
         working-directory: desktop
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
