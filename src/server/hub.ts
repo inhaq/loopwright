@@ -23,7 +23,7 @@ export type RunMessageType =
   | "log"; // a human-readable log line from the engine
 
 export interface RunMessage {
-  /** 0-based index within the session, used as the SSE event id for resume. */
+  /** Monotonic per-session ordinal, used as the SSE event id for resume. */
   id: number;
   type: RunMessageType;
   data: unknown;
@@ -45,12 +45,25 @@ interface Channel {
   buffer: RunMessage[];
   emitter: EventEmitter;
   phase: RunPhase;
+  /** next id to assign; never reused even after the buffer is trimmed */
+  seq: number;
 }
 
 const MESSAGE_EVENT = "message";
 
+/** Default cap on retained messages per session (bounds memory). */
+const DEFAULT_MAX_BUFFER = 2000;
+
 export class RunHub {
   private readonly channels = new Map<string, Channel>();
+
+  /**
+   * @param maxBuffer most recent messages retained per session for replay.
+   *   Older messages are dropped once exceeded; ids stay monotonic so
+   *   `Last-Event-ID` resume is unaffected (a client that connects after a
+   *   trim simply won't replay the dropped early messages).
+   */
+  constructor(private readonly maxBuffer: number = DEFAULT_MAX_BUFFER) {}
 
   private channel(sessionId: string): Channel {
     let ch = this.channels.get(sessionId);
@@ -59,7 +72,7 @@ export class RunHub {
       // Each SSE client adds a listener; a long run with several open monitor
       // tabs would otherwise trip Node's default 10-listener leak warning.
       emitter.setMaxListeners(0);
-      ch = { buffer: [], emitter, phase: "running" };
+      ch = { buffer: [], emitter, phase: "running", seq: 0 };
       this.channels.set(sessionId, ch);
     }
     return ch;
@@ -77,8 +90,12 @@ export class RunHub {
   /** Publishes a message to a session, assigning it the next ordinal id. */
   publish(sessionId: string, type: RunMessageType, data: unknown): RunMessage {
     const ch = this.channel(sessionId);
-    const msg: RunMessage = { id: ch.buffer.length, type, data };
+    const msg: RunMessage = { id: ch.seq++, type, data };
     ch.buffer.push(msg);
+    // Bound memory: retain only the most recent `maxBuffer` messages.
+    if (ch.buffer.length > this.maxBuffer) {
+      ch.buffer.splice(0, ch.buffer.length - this.maxBuffer);
+    }
     if (type === "status") {
       const phase = (data as RunStatusData).phase;
       if (phase) ch.phase = phase;

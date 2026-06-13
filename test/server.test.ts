@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createServer, type LoopwrightServer, type RunGoalImpl } from "../src/server/server.js";
 import { MemoryStore } from "../src/storage/store.js";
 import { loadConfig, type LoopwrightConfig } from "../src/config.js";
@@ -184,6 +187,65 @@ describe("server: auth boundary", () => {
     const res = await fetch(`${base}/api/runs/${sessionId}/stream?token=${TOKEN}`);
     expect(res.status).toBe(200);
     await res.body?.cancel();
+  });
+
+  it("does NOT accept a query token on non-stream routes", async () => {
+    // Query-token auth is restricted to /stream so tokens don't leak via URLs.
+    expect((await fetch(`${base}/api/sessions?token=${TOKEN}`)).status).toBe(401);
+  });
+});
+
+describe("server: admission control", () => {
+  it("rejects new runs past the active cap with 429", async () => {
+    let release: () => void = () => {};
+    const hold = new Promise<void>((r) => {
+      release = r;
+    });
+    server = createServer({
+      store: new MemoryStore(),
+      config: baseConfig,
+      baseEnv: {},
+      token: TOKEN,
+      maxActiveRuns: 1,
+      // First run stays active until released, holding the only slot.
+      runGoalImpl: async (g, c, opts = {}) => {
+        await hold;
+        return simulatedRun(g, c, opts);
+      },
+    });
+    base = `http://127.0.0.1:${await server.start(0)}`;
+
+    const first = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: auth({ "content-type": "application/json" }),
+      body: JSON.stringify({ goal: "one" }),
+    });
+    expect(first.status).toBe(202);
+
+    const second = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: auth({ "content-type": "application/json" }),
+      body: JSON.stringify({ goal: "two" }),
+    });
+    expect(second.status).toBe(429);
+
+    release();
+  });
+});
+
+describe("server: static assets", () => {
+  it("serves index.html without CORS and injects the token", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "lw-static-"));
+    writeFileSync(path.join(dir, "index.html"), "<html><head></head><body>hi</body></html>");
+    server = createServer({ store: new MemoryStore(), config: baseConfig, baseEnv: {}, token: TOKEN, staticDir: dir });
+    base = `http://127.0.0.1:${await server.start(0)}`;
+
+    // A page on another loopback origin must not be able to read the token.
+    const res = await fetch(`${base}/`, { headers: { origin: "http://localhost:9999" } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("access-control-allow-origin")).toBeNull();
+    const html = await res.text();
+    expect(html).toContain(`window.__LOOPWRIGHT_TOKEN__="${TOKEN}"`);
   });
 });
 

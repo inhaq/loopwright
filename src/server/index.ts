@@ -13,6 +13,7 @@
  *   LOOPWRIGHT_HOST        host to bind (default 127.0.0.1, loopback only)
  *   LOOPWRIGHT_STATIC_DIR  optional dir of built frontend assets to serve
  *   LOOPWRIGHT_TOKEN       bearer token required on /api (default: random)
+ *   LOOPWRIGHT_ALLOW_NON_LOOPBACK  opt-in to bind a non-loopback host (unsafe)
  *
  * Compiled to a single binary via `bun build --compile` and shipped as a
  * Tauri sidecar; also runnable directly (`npm run serve`) to use the UI from a
@@ -22,7 +23,11 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { loadConfig } from "../config.js";
 import { openStore } from "../storage/store.js";
-import { createServer } from "./server.js";
+import { createServer, isLoopbackHost } from "./server.js";
+
+function envFlag(v: string | undefined): boolean {
+  return v !== undefined && ["1", "true", "yes", "on"].includes(v.trim().toLowerCase());
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -44,6 +49,19 @@ async function main(): Promise<void> {
 
   const port = Number.parseInt(process.env.LOOPWRIGHT_PORT ?? "0", 10) || 0;
   const host = process.env.LOOPWRIGHT_HOST ?? "127.0.0.1";
+
+  // The engine serves a token-authenticated local API (and, with a static dir,
+  // injects that token into index.html). Binding a non-loopback host would
+  // expose both over the network, contradicting the security model — refuse
+  // unless explicitly opted in.
+  if (!isLoopbackHost(host) && !envFlag(process.env.LOOPWRIGHT_ALLOW_NON_LOOPBACK)) {
+    console.error(
+      `Refusing to bind non-loopback host "${host}". The engine exposes a local, ` +
+        `token-authenticated API. Set LOOPWRIGHT_ALLOW_NON_LOOPBACK=1 to override (unsafe).`,
+    );
+    process.exit(1);
+  }
+
   const bound = await server.start(port, host);
 
   // Single-line, parseable readiness signal for the supervising process.

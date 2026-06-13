@@ -71,6 +71,12 @@ export interface CreateServerOptions {
    * shell) to control it.
    */
   token?: string;
+  /** max runs that may be active concurrently before new ones get 429 */
+  maxActiveRuns?: number;
+  /** how long (ms) to retain a finished run's event buffer before releasing it */
+  retainMs?: number;
+  /** most recent messages retained per run for SSE replay */
+  maxBufferPerRun?: number;
 }
 
 export interface LoopwrightServer {
@@ -93,6 +99,11 @@ function send(res: ServerResponse, status: number, body: unknown, cors: Record<s
 }
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+/** True for hosts that only accept connections from the local machine. */
+export function isLoopbackHost(host: string): boolean {
+  return LOOPBACK_HOSTS.has(host.trim().toLowerCase());
+}
 
 /** Loopback and the Tauri webview are the only origins ever granted CORS. */
 function originAllowed(origin: string): boolean {
@@ -154,14 +165,22 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   const baseEnv = opts.baseEnv ?? process.env;
   const rates = opts.rates ?? {};
   const token = opts.token ?? randomUUID();
-  const hub = new RunHub();
+  const maxActiveRuns = opts.maxActiveRuns ?? 4;
+  const retainMs = opts.retainMs ?? 5 * 60_000;
+  const hub = new RunHub(opts.maxBufferPerRun);
+  let activeRuns = 0;
 
-  /** Constant-time bearer-token check (header or `token` query param). */
-  function authorized(req: IncomingMessage, url: URL): boolean {
+  /**
+   * Constant-time bearer-token check. The token is read from the Authorization
+   * header; the `token` query param is accepted ONLY where `allowQuery` is set
+   * (the SSE stream, since EventSource can't send headers) so tokens don't leak
+   * into URLs/logs for ordinary requests.
+   */
+  function authorized(req: IncomingMessage, url: URL, allowQuery: boolean): boolean {
     const auth = req.headers.authorization;
     let provided: string | undefined;
     if (typeof auth === "string" && auth.startsWith("Bearer ")) provided = auth.slice(7);
-    else provided = url.searchParams.get("token") ?? undefined;
+    else if (allowQuery) provided = url.searchParams.get("token") ?? undefined;
     if (!provided) return false;
     const a = Buffer.from(provided);
     const b = Buffer.from(token);
@@ -195,9 +214,12 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
 
     // Everything else under /api requires the token. This is the boundary that
     // stops a page on another origin from starting runs (which can execute
-    // local commands and exfiltrate secrets via runner profiles).
+    // local commands and exfiltrate secrets via runner profiles). Only the SSE
+    // stream may carry the token as a query param (EventSource can't set
+    // headers); all other routes require the Authorization header.
+    const isStream = method === "GET" && /^\/api\/runs\/[^/]+\/stream$/.test(pathname);
     if (pathname.startsWith("/api/")) {
-      if (!authorized(req, url)) return send(res, 401, { error: "unauthorized" }, cors);
+      if (!authorized(req, url, isStream)) return send(res, 401, { error: "unauthorized" }, cors);
     }
 
     if (pathname === "/api/runs" && method === "POST") {
@@ -231,7 +253,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       return send(res, 404, { error: "not found" }, cors);
     }
 
-    if (staticDir) return serveStatic(res, pathname, staticDir, cors);
+    if (staticDir) return serveStatic(res, pathname);
     return send(res, 404, { error: "not found" }, cors);
   }
 
@@ -261,6 +283,16 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     if (hub.has(sessionId) && hub.phase(sessionId) === "running") {
       return send(res, 409, { error: `session ${sessionId} is already running` }, cors);
     }
+    // Admission control: cap concurrent background runs so repeated clicks, a
+    // buggy UI, or a leaked token can't kick off unbounded expensive work.
+    if (activeRuns >= maxActiveRuns) {
+      return send(
+        res,
+        429,
+        { error: `too many active runs (max ${maxActiveRuns}); wait for one to finish` },
+        cors,
+      );
+    }
 
     // Live wiring: the observer streams transitions/attempts/outcomes; the
     // tapping store streams lifecycle + runner-call events; `log` streams the
@@ -272,7 +304,17 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     };
     const tappedStore = tapStoreEvents(store, (rec) => hub.publish(sessionId, "event", rec));
 
+    activeRuns += 1;
     hub.publish(sessionId, "status", { phase: "running" } satisfies RunStatusData);
+
+    // Frees the active-run slot and, after a grace period, releases the run's
+    // in-memory event buffer (late viewers can still catch up until then; the
+    // durable trace remains available from the store afterwards).
+    const settle = (): void => {
+      activeRuns = Math.max(0, activeRuns - 1);
+      const timer = setTimeout(() => hub.forget(sessionId), retainMs);
+      if (typeof timer.unref === "function") timer.unref();
+    };
 
     // Fire-and-forget: the run proceeds in the background and the client
     // follows it over SSE. Errors are surfaced as a terminal status message.
@@ -285,12 +327,14 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     })
       .then((result) => {
         hub.publish(sessionId, "status", { phase: "done", result } satisfies RunStatusData);
+        settle();
       })
       .catch((err: unknown) => {
         hub.publish(sessionId, "status", {
           phase: "error",
           error: String((err as Error)?.message ?? err),
         } satisfies RunStatusData);
+        settle();
       });
 
     send(res, 202, { sessionId }, cors);
@@ -346,12 +390,11 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     res.on("close", close);
   }
 
-  async function serveStatic(
-    res: ServerResponse,
-    pathname: string,
-    dir: string,
-    cors: Record<string, string>,
-  ): Promise<void> {
+  async function serveStatic(res: ServerResponse, pathname: string): Promise<void> {
+    // Static assets are served WITHOUT CORS headers. The standalone browser UI
+    // loads them same-origin (no CORS needed), and withholding CORS stops a
+    // page on another origin from reading the injected token out of index.html.
+    const dir = staticDir as string;
     // Normalize the asset root to an absolute path so the traversal guard below
     // compares like with like even when `dir` came in relative (e.g. a relative
     // LOOPWRIGHT_STATIC_DIR), which would otherwise reject every request.
@@ -360,10 +403,10 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     const resolved = path.resolve(root, rel);
     // Path-traversal guard: never serve outside the asset directory.
     if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-      return send(res, 403, { error: "forbidden" }, cors);
+      return send(res, 403, { error: "forbidden" });
     }
     const file = await resolveFile(resolved, root);
-    if (!file) return send(res, 404, { error: "not found" }, cors);
+    if (!file) return send(res, 404, { error: "not found" });
 
     // index.html is served same-origin to the trusted UI; inject the auth token
     // so the browser build can authenticate without an unauthenticated token
@@ -372,7 +415,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       const html = await readFile(file, "utf8");
       const tag = `<script>window.__LOOPWRIGHT_TOKEN__=${JSON.stringify(token)}</script>`;
       const injected = html.includes("</head>") ? html.replace("</head>", `${tag}</head>`) : tag + html;
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", ...cors });
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(injected);
       return;
     }
@@ -380,7 +423,6 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     const ext = path.extname(file).toLowerCase();
     res.writeHead(200, {
       "content-type": STATIC_CONTENT_TYPES[ext] ?? "application/octet-stream",
-      ...cors,
     });
     createReadStream(file).pipe(res);
   }
