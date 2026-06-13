@@ -1,5 +1,6 @@
 import type { AgentRunner, RunnerProfile } from "./agentRunner.js";
 import { CliRunner } from "./cliRunner.js";
+import { HttpRunner } from "./httpRunner.js";
 import { MockRunner } from "./mockRunner.js";
 
 /**
@@ -28,12 +29,7 @@ export const createRunner: RunnerFactory = (profile) => {
     case "mock":
       return MockRunner.fromProfile(profile);
     case "http":
-      // HttpRunner is the next task (Milestone 2, Task 14). Fail clearly rather
-      // than silently degrading so a profile referencing it is obvious.
-      throw new UnknownRunnerKindError(
-        `Runner kind "http" is not implemented yet (Task 14). ` +
-          `Profile "${profile.id}" cannot be built.`,
-      );
+      return new HttpRunner(profile);
     default: {
       // Exhaustiveness guard: a new RunnerKind must be handled above.
       const exhaustive: never = profile.kind;

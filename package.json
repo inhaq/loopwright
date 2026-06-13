@@ -9,6 +9,7 @@
   },
   "scripts": {
     "demo": "tsx src/demo.ts",
+    "start": "tsx src/run.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { createRunner, UnknownRunnerKindError } from "../src/runners/runnerFactory.js";
 import { CliRunner } from "../src/runners/cliRunner.js";
+import { HttpRunner } from "../src/runners/httpRunner.js";
 import { MockRunner } from "../src/runners/mockRunner.js";
 import type { AgentRunner, RunnerProfile } from "../src/runners/agentRunner.js";
 import { createRoles, RoleBindingError } from "../src/adapters/roleBindings.js";
@@ -27,10 +28,21 @@ describe("createRunner factory", () => {
     expect(second.quotaExhausted).toBe(true);
   });
 
-  it("throws a clear error for kind=http (not implemented yet)", () => {
-    expect(() => createRunner({ id: "h", kind: "http", model: "m" })).toThrow(
-      UnknownRunnerKindError,
-    );
+  it("builds an HttpRunner for kind=http", () => {
+    const r = createRunner({
+      id: "h",
+      kind: "http",
+      model: "m",
+      options: { baseUrl: "https://host/v1" },
+    });
+    expect(r).toBeInstanceOf(HttpRunner);
+  });
+
+  it("throws a clear error for an unknown runner kind", () => {
+    // cast through unknown: the type system also guards this at compile time
+    expect(() =>
+      createRunner({ id: "x", kind: "telepathy" as never, model: "m" }),
+    ).toThrow(UnknownRunnerKindError);
   });
 });
 
