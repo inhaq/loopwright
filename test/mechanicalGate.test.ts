@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runMechanicalGate } from "../src/engine/mechanicalGate.js";
+import { runMechanicalGate, createShellExecutor, TIMEOUT_EXIT_CODE } from "../src/engine/mechanicalGate.js";
 import { scriptedExecutor } from "../src/adapters/mocks.js";
 
 describe("mechanical gate", () => {
@@ -34,4 +34,23 @@ describe("mechanical gate", () => {
     expect(r.steps[0]?.output).not.toContain("sk-deadbeef");
     expect(r.steps[0]?.output).toContain("[REDACTED]");
   });
+});
+
+
+describe("shell executor safeguards", () => {
+  it("kills a command that exceeds the timeout", async () => {
+    const exec = createShellExecutor({ timeoutMs: 200 });
+    const start = Date.now();
+    const r = await exec("sleep 5", ".");
+    expect(r.exitCode).toBe(TIMEOUT_EXIT_CODE);
+    expect(r.output).toContain("timeout");
+    expect(Date.now() - start).toBeLessThan(4000);
+  }, 10_000);
+
+  it("bounds captured output to the configured max", async () => {
+    const exec = createShellExecutor({ maxCapturedChars: 100 });
+    const r = await exec("for i in $(seq 1 1000); do echo AAAAAAAAAA; done", ".");
+    expect(r.exitCode).toBe(0);
+    expect(r.output.length).toBeLessThanOrEqual(100);
+  }, 10_000);
 });

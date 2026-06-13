@@ -41,3 +41,17 @@ describe("redaction", () => {
     expect(out).toContain("truncated");
   });
 });
+
+
+describe("redaction hardening", () => {
+  it("redacts bearer tokens regardless of casing", () => {
+    expect(redact("authorization: bearer abcdef12345678")).not.toContain("abcdef12345678");
+    expect(redact("BEARER ABCDEF12345678")).not.toContain("ABCDEF12345678");
+  });
+
+  it("strips the username from Windows home paths", () => {
+    const out = redact("C:\\Users\\Alice\\project\\x.ts");
+    expect(out).toContain("C:\\Users\\[user]");
+    expect(out).not.toContain("Alice");
+  });
+});

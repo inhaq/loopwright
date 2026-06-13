@@ -164,3 +164,17 @@ describe("plan-review loop", () => {
     expect(out.openItems.length).toBeGreaterThan(0);
   });
 });
+
+
+describe("fallback self-review", () => {
+  it("never surfaces blocker-severity findings as nits", async () => {
+    const t = task();
+    const actor = new MockActor({ plans: [onePlan(t)], selfReview: criticBlock([blocker, nit]) });
+    const critic = new MockCritic({ taskResponses: { t1: [criticQuotaExhausted()] } });
+
+    const out = await runTask(t, makeDeps({ actor, critic }));
+    expect(out.finalState).toBe("UNVERIFIED_BY_CRITIC");
+    expect(out.nits.every((f) => f.severity === "nit")).toBe(true);
+    expect(out.nits).toHaveLength(1); // the blocker was filtered out
+  });
+});

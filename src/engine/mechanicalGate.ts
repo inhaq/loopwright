@@ -25,32 +25,72 @@ export type CommandExecutor = (
   cwd: string,
 ) => Promise<CommandOutcome>;
 
-/** Default executor: runs the command in a shell, capturing combined output. */
-export const defaultExecutor: CommandExecutor = (command, cwd) =>
-  new Promise((resolve) => {
-    const started = Date.now();
-    const child = spawn(command, { cwd, shell: true });
-    let output = "";
-    const append = (buf: Buffer) => {
-      output += buf.toString();
-    };
-    child.stdout.on("data", append);
-    child.stderr.on("data", append);
-    child.on("error", (err) => {
-      resolve({
-        exitCode: 127,
-        output: `${output}\n${err.message}`,
-        durationMs: Date.now() - started,
+const DEFAULT_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_MAX_CAPTURED_CHARS = 200_000;
+/** exit code used to signal a command was killed for exceeding the timeout */
+export const TIMEOUT_EXIT_CODE = 124;
+
+export interface ShellExecutorOptions {
+  /** hard wall-clock limit before the child is SIGKILLed */
+  timeoutMs?: number;
+  /** rolling cap on captured output so a runaway log can't exhaust memory */
+  maxCapturedChars?: number;
+}
+
+/**
+ * Creates a shell CommandExecutor with two safeguards a hung/chatty verify
+ * command would otherwise breach: a hard timeout (kills the child and returns
+ * {@link TIMEOUT_EXIT_CODE}) and bounded capture (keeps only the most recent
+ * tail in memory, well before the post-exit redaction/truncation step).
+ */
+export function createShellExecutor(
+  opts: ShellExecutorOptions = {},
+): CommandExecutor {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxChars = opts.maxCapturedChars ?? DEFAULT_MAX_CAPTURED_CHARS;
+
+  return (command, cwd) =>
+    new Promise((resolve) => {
+      const started = Date.now();
+      const child = spawn(command, { cwd, shell: true });
+      let output = "";
+      let timedOut = false;
+
+      const append = (buf: Buffer) => {
+        output += buf.toString();
+        if (output.length > maxChars) output = output.slice(-maxChars);
+      };
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeoutMs);
+
+      child.stdout.on("data", append);
+      child.stderr.on("data", append);
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        resolve({
+          exitCode: 127,
+          output: `${output}\n${err.message}`,
+          durationMs: Date.now() - started,
+        });
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({
+          exitCode: timedOut ? TIMEOUT_EXIT_CODE : (code ?? 1),
+          output: timedOut
+            ? `${output}\n[killed: exceeded ${timeoutMs}ms timeout]`
+            : output,
+          durationMs: Date.now() - started,
+        });
       });
     });
-    child.on("close", (code) => {
-      resolve({
-        exitCode: code ?? 1,
-        output,
-        durationMs: Date.now() - started,
-      });
-    });
-  });
+}
+
+/** Default executor: runs the command in a shell with timeout + bounded capture. */
+export const defaultExecutor: CommandExecutor = createShellExecutor();
 
 export interface MechanicalGateOptions {
   cwd: string;
@@ -68,8 +108,10 @@ export async function runMechanicalGate(
   const executor = opts.executor ?? defaultExecutor;
   const steps: MechanicalStepResult[] = [];
 
-  // No verify commands declared = nothing to mechanically prove. We treat this
-  // as a (loud) pass; the loop surfaces it so a missing DoD is visible.
+  // No verify commands declared = nothing to mechanically prove, so this is a
+  // pass at the mechanical layer ONLY. GREEN is still gated by the critic's
+  // semantic review, and a task with no machine-checkable DoD is expected to be
+  // caught by the critic during plan review rather than blocked by the schema.
   if (commands.length === 0) {
     return { passed: true, steps: [] };
   }
