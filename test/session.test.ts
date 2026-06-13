@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runGoal, openBlockers, finalSessionStatus } from "../src/session.js";
+import { runGoal, openBlockers, finalSessionStatus, reconcileInterruptedSessions } from "../src/session.js";
 import { loadConfig } from "../src/config.js";
 import { MockRunner } from "../src/runners/mockRunner.js";
 import type { AgentRunner, RunnerProfile, RunRequest } from "../src/runners/agentRunner.js";
@@ -156,5 +156,21 @@ describe("finalSessionStatus", () => {
     // A clean per-task run that fails to integrate (conflicts / failed verify)
     // must not be reported as completed.
     expect(finalSessionStatus(0, { ok: false })).toBe("needs_human");
+  });
+});
+
+describe("reconcileInterruptedSessions", () => {
+  it("marks orphaned running sessions as failed with an event", async () => {
+    const store = new MemoryStore();
+    const now = new Date().toISOString();
+    await store.createSession({ id: "stuck", goal: "g", createdAt: now, updatedAt: now, status: "running" });
+    await store.createSession({ id: "ok", goal: "g", createdAt: now, updatedAt: now, status: "completed" });
+
+    const n = await reconcileInterruptedSessions(store);
+    expect(n).toBe(1);
+    expect((await store.getSession("stuck"))?.status).toBe("failed");
+    expect((await store.getSession("ok"))?.status).toBe("completed"); // untouched
+    const events = await store.listEvents("stuck");
+    expect(events.some((e) => e.type === "session_interrupted")).toBe(true);
   });
 });

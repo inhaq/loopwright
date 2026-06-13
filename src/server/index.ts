@@ -23,6 +23,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { loadConfig } from "../config.js";
 import { openStore } from "../storage/store.js";
+import { reconcileInterruptedSessions } from "../session.js";
 import { createServer, isLoopbackHost } from "./server.js";
 
 function envFlag(v: string | undefined): boolean {
@@ -32,6 +33,14 @@ function envFlag(v: string | undefined): boolean {
 async function main(): Promise<void> {
   const config = loadConfig();
   const store = await openStore(config.dbPath);
+
+  // Reconcile sessions left "running" by a previous process that was killed or
+  // crashed mid-run (e.g. the desktop "restart engine" button), so they don't
+  // stay stuck running forever.
+  const reconciled = await reconcileInterruptedSessions(store);
+  if (reconciled > 0) {
+    console.error(`Marked ${reconciled} interrupted session(s) as failed on startup.`);
+  }
 
   // Resolve to an absolute path so the server's path-traversal guard works even
   // when a relative LOOPWRIGHT_STATIC_DIR is supplied.

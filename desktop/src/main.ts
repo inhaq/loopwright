@@ -1,6 +1,7 @@
 import "./styles.css";
 import {
   apiBase,
+  cancelRun,
   deleteSecret,
   getTrace,
   health,
@@ -174,6 +175,21 @@ function renderMonitor(sessionId: string, goal: string): void {
 
   view.append(header, usage, tasksCard, logCard);
 
+  // Stop control: requests cooperative cancellation of the in-flight run.
+  const stopBtn = h("button", { class: "danger" }, ["Stop run"]);
+  stopBtn.addEventListener("click", async () => {
+    stopBtn.setAttribute("disabled", "true");
+    stopBtn.textContent = "Stopping…";
+    try {
+      await cancelRun(sessionId);
+    } catch (err) {
+      stopBtn.removeAttribute("disabled");
+      stopBtn.textContent = "Stop run";
+      (document.getElementById("plan") as HTMLElement).textContent = `Cancel failed: ${(err as Error).message}`;
+    }
+  });
+  (header.querySelector("#phase") as HTMLElement).append(" ", stopBtn);
+
   const taskRows = new Map<string, HTMLElement>();
   let actorCalls = 0;
   let criticCalls = 0;
@@ -226,6 +242,9 @@ function renderMonitor(sessionId: string, goal: string): void {
       }
     } else if (msg.type === "status") {
       const phase = document.getElementById("phase") as HTMLElement;
+      if (msg.data.phase === "done" || msg.data.phase === "error") {
+        stopBtn.remove(); // run is over; no longer cancellable
+      }
       if (msg.data.phase === "done") {
         // "done" is not necessarily success: a clean per-task run can still
         // fail to integrate (merge conflicts / failed verification), and some

@@ -195,6 +195,39 @@ describe("server: auth boundary", () => {
   });
 });
 
+describe("server: run cancellation", () => {
+  it("cancels an in-flight run and surfaces a terminal error", async () => {
+    await server?.stop();
+    server = createServer({
+      store: new MemoryStore(),
+      config: baseConfig,
+      baseEnv: {},
+      token: TOKEN,
+      // A run that only settles when its AbortSignal fires.
+      runGoalImpl: (_g, _c, o = {}) =>
+        new Promise((_resolve, reject) => {
+          o.signal?.addEventListener("abort", () => {
+            const e = new Error("run cancelled");
+            e.name = "AbortError";
+            reject(e);
+          });
+        }),
+    });
+    base = `http://127.0.0.1:${await server.start(0)}`;
+
+    const sessionId = await startRun("long running");
+    expect((await fetch(`${base}/api/runs/ghost/cancel`, { method: "POST", headers: auth() })).status).toBe(404);
+
+    const cancelled = await fetch(`${base}/api/runs/${sessionId}/cancel`, { method: "POST", headers: auth() });
+    expect(cancelled.status).toBe(202);
+
+    const stream = await fetch(`${base}/api/runs/${sessionId}/stream`, { headers: auth() });
+    const msgs = await readSse(stream, (m) => m.some((x) => x.event === "status" && x.data.phase === "error"));
+    const err = msgs.find((m) => m.event === "status" && m.data.phase === "error");
+    expect(err?.data.error).toContain("cancelled");
+  });
+});
+
 describe("server: admission control", () => {
   it("rejects new runs past the active cap with 429", async () => {
     let release: () => void = () => {};

@@ -90,6 +90,15 @@ export async function startRun(body: StartRunBody): Promise<string> {
   return sessionId;
 }
 
+/** Requests cancellation of an in-flight run. 404 (already finished) is ignored. */
+export async function cancelRun(sessionId: string): Promise<void> {
+  const res = await fetch((await apiBase()) + `/api/runs/${encodeURIComponent(sessionId)}/cancel`, {
+    method: "POST",
+    headers: await authHeaders(),
+  });
+  if (!res.ok && res.status !== 404) throw new Error(`${res.status} ${await res.text()}`);
+}
+
 export async function listSessions(): Promise<SessionRecord[]> {
   const { sessions } = await getJson<{ sessions: SessionRecord[] }>("/api/sessions");
   return sessions;

@@ -169,6 +169,8 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   const retainMs = opts.retainMs ?? 5 * 60_000;
   const hub = new RunHub(opts.maxBufferPerRun);
   let activeRuns = 0;
+  /** abort controllers for in-flight runs, keyed by session id (for cancel) */
+  const controllers = new Map<string, AbortController>();
 
   /**
    * Constant-time bearer-token check. The token is read from the Authorization
@@ -229,6 +231,15 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     const streamMatch = pathname.match(/^\/api\/runs\/([^/]+)\/stream$/);
     if (streamMatch && method === "GET") {
       return streamRun(req, res, decodeURIComponent(streamMatch[1] as string), cors);
+    }
+
+    const cancelMatch = pathname.match(/^\/api\/runs\/([^/]+)\/cancel$/);
+    if (cancelMatch && method === "POST") {
+      const id = decodeURIComponent(cancelMatch[1] as string);
+      const controller = controllers.get(id);
+      if (!controller) return send(res, 404, { error: `no active run for session "${id}"` }, cors);
+      controller.abort();
+      return send(res, 202, { cancelling: true }, cors);
     }
 
     if (pathname === "/api/sessions" && method === "GET") {
@@ -305,6 +316,9 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     const tappedStore = tapStoreEvents(store, (rec) => hub.publish(sessionId, "event", rec));
 
     activeRuns += 1;
+    // Per-run abort controller so POST /api/runs/:id/cancel can stop it.
+    const controller = new AbortController();
+    controllers.set(sessionId, controller);
     // Begin a fresh hub channel for this run: discards any retained buffer from
     // a previous run that reused this session id (so the stream can't replay
     // stale events) and yields a generation token for the cleanup guard below.
@@ -317,18 +331,21 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     // generation guard ensures this never drops a newer run on the same id.
     const settle = (): void => {
       activeRuns = Math.max(0, activeRuns - 1);
+      controllers.delete(sessionId);
       const timer = setTimeout(() => hub.forget(sessionId, generation), retainMs);
       if (typeof timer.unref === "function") timer.unref();
     };
 
     // Fire-and-forget: the run proceeds in the background and the client
-    // follows it over SSE. Errors are surfaced as a terminal status message.
+    // follows it over SSE. Errors (including cancellation) surface as a terminal
+    // status message.
     void runGoalImpl(goal, runConfig, {
       store: tappedStore,
       sessionId,
       resume: body.resume ?? false,
       observer,
       log: (line) => void hub.publish(sessionId, "log", { line }),
+      signal: controller.signal,
     })
       .then((result) => {
         hub.publish(sessionId, "status", { phase: "done", result } satisfies RunStatusData);

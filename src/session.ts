@@ -79,6 +79,8 @@ export interface RunGoalOptions extends CreateRolesOptions {
    * after the run (Tasks 20, 21).
    */
   repoDir?: string;
+  /** cooperative cancellation: aborts scheduling, gate commands, and the run */
+  signal?: AbortSignal;
 }
 
 export async function runGoal(
@@ -95,6 +97,7 @@ export async function runGoal(
     workspaceFor,
     onTaskSettled,
     repoDir,
+    signal,
     ...roleOpts
   } = opts;
   const cwd = opts.cwd ?? ".";
@@ -158,6 +161,7 @@ export async function runGoal(
       ...(executor ? { executor } : {}),
       ...(opts.log ? { log: opts.log } : {}),
       ...(observer ? { observer } : {}),
+      ...(signal ? { signal } : {}),
     };
 
     const plan = await runPlanReview(goal, baseDeps);
@@ -344,6 +348,30 @@ export function finalSessionStatus(
   if (needsHumanCount > 0) return "needs_human";
   if (integration && !integration.ok) return "needs_human";
   return "completed";
+}
+
+/**
+ * Marks any session left as `running` (e.g. because the engine process was
+ * killed/restarted mid-run, bypassing the normal failure path) as `failed`,
+ * recording a `session_interrupted` event. Call this at startup so a crashed or
+ * restarted engine doesn't leave durable sessions stuck "running" forever.
+ * Returns the number of sessions reconciled.
+ */
+export async function reconcileInterruptedSessions(store: Store): Promise<number> {
+  const sessions = await store.listSessions();
+  let reconciled = 0;
+  for (const s of sessions) {
+    if (s.status !== "running") continue;
+    await store.recordEvent({
+      sessionId: s.id,
+      at: new Date().toISOString(),
+      type: EVENT_TYPES.sessionInterrupted,
+      data: { reason: "engine restarted or crashed while the run was in progress" },
+    });
+    await store.updateSession(s.id, { status: "failed" });
+    reconciled += 1;
+  }
+  return reconciled;
 }
 
 /** Flattens a session's still-open blocking findings for reporting. */

@@ -17,11 +17,12 @@ import {
   type TaskState,
 } from "../domain/stateMachine.js";
 import { runMechanicalGate, type CommandExecutor } from "./mechanicalGate.js";
-import { guardProgress } from "./watchdog.js";
+import { guardProgress, type Guarded } from "./watchdog.js";
 import { redact, redactAndTruncate } from "./redaction.js";
 import { parseCriticResponse, REPAIR_HINT } from "./criticParser.js";
 import type {
   Actor,
+  ActorBuildResult,
   BuildFeedback,
   Critic,
   CriticRequest,
@@ -44,6 +45,8 @@ export interface LoopDeps {
    * config.stuckThresholdMs when set. <= 0 disables it. (Milestone 3, Task 18)
    */
   stuckThresholdMs?: number;
+  /** cancels the run cooperatively: checked between steps; kills gate commands */
+  signal?: AbortSignal;
 }
 
 /** A single state transition, surfaced to observers as it happens. */
@@ -240,10 +243,27 @@ export async function runTask(
   state = await fire("BUILD_STARTED", "initial build");
 
   while (!isTerminal(state)) {
+    // Cooperative cancellation: bail to a terminal state between steps so an
+    // in-flight task stops promptly when the run is cancelled.
+    if (deps.signal?.aborted) {
+      degradedReason = "Run cancelled before completion.";
+      await fire("STUCK_ABORTED", degradedReason); // routes to NEEDS_HUMAN
+      break;
+    }
     switch (state) {
       case "BUILDING": {
         buildAttempts++;
-        const guardedBuild = await guardProgress(deps.actor.build(task, feedback), stuckThresholdMs);
+        let guardedBuild: Guarded<ActorBuildResult>;
+        try {
+          guardedBuild = await guardProgress(deps.actor.build(task, feedback), stuckThresholdMs);
+        } catch (err) {
+          // An actor/model failure (quota, unusable output, transport) is
+          // task-fatal, not session-fatal: degrade this task to NEEDS_HUMAN
+          // (like a malformed critic) instead of throwing out of the run.
+          degradedReason = `Actor build failed: ${String((err as Error)?.message ?? err)}`;
+          await fire("STUCK_ABORTED", degradedReason); // routes BUILDING -> NEEDS_HUMAN
+          break;
+        }
         if (guardedBuild.stuck) {
           degradedReason = `No progress within ${guardedBuild.elapsedMs}ms while building (stuck).`;
           await fire("STUCK_ABORTED", degradedReason);
@@ -264,6 +284,7 @@ export async function runTask(
           lastGate = await runMechanicalGate(task.verifyCommands, {
             cwd: deps.cwd,
             ...(deps.executor ? { executor: deps.executor } : {}),
+            ...(deps.signal ? { signal: deps.signal } : {}),
           });
           if (lastGate.passed) {
             await fire("MECHANICAL_PASSED", `gate passed (${lastGate.steps.length} step(s))`);

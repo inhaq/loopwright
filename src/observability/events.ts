@@ -39,6 +39,7 @@ export const EVENT_TYPES = {
   sessionFinished: "session_finished",
   integration: "integration",
   sessionFailed: "session_failed",
+  sessionInterrupted: "session_interrupted",
 } as const;
 
 function num(v: unknown): number {
