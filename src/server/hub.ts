@@ -47,6 +47,8 @@ interface Channel {
   phase: RunPhase;
   /** next id to assign; never reused even after the buffer is trimmed */
   seq: number;
+  /** bumped each time a fresh run (re)starts on this session id */
+  generation: number;
 }
 
 const MESSAGE_EVENT = "message";
@@ -72,10 +74,26 @@ export class RunHub {
       // Each SSE client adds a listener; a long run with several open monitor
       // tabs would otherwise trip Node's default 10-listener leak warning.
       emitter.setMaxListeners(0);
-      ch = { buffer: [], emitter, phase: "running", seq: 0 };
+      ch = { buffer: [], emitter, phase: "running", seq: 0, generation: 1 };
       this.channels.set(sessionId, ch);
     }
     return ch;
+  }
+
+  /**
+   * Begins a fresh run for a session, discarding any retained buffer and
+   * listeners from a previous (finished) run so a reused session id can never
+   * replay the old run's events. Returns a generation token that {@link forget}
+   * uses so a late cleanup timer from the old run can't drop the new channel.
+   */
+  start(sessionId: string): number {
+    const existing = this.channels.get(sessionId);
+    const generation = (existing?.generation ?? 0) + 1;
+    if (existing) existing.emitter.removeAllListeners();
+    const emitter = new EventEmitter();
+    emitter.setMaxListeners(0);
+    this.channels.set(sessionId, { buffer: [], emitter, phase: "running", seq: 0, generation });
+    return generation;
   }
 
   /** True once a run for this session has been registered (started). */
@@ -126,10 +144,16 @@ export class RunHub {
     return () => ch.emitter.off(MESSAGE_EVENT, listener);
   }
 
-  /** Drops a finished session's buffer to bound memory (optional cleanup). */
-  forget(sessionId: string): void {
+  /**
+   * Drops a finished session's buffer to bound memory. When `generation` is
+   * given, only forgets if it still matches — so a cleanup timer scheduled by
+   * an old run won't delete a newer run that reused the same session id.
+   */
+  forget(sessionId: string, generation?: number): void {
     const ch = this.channels.get(sessionId);
-    if (ch) ch.emitter.removeAllListeners();
+    if (!ch) return;
+    if (generation !== undefined && ch.generation !== generation) return;
+    ch.emitter.removeAllListeners();
     this.channels.delete(sessionId);
   }
 }

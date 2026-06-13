@@ -259,15 +259,32 @@ export class JsonFileStore extends BaseStore {
 
   /** Opens (or initializes) the store at `filePath`, loading any existing data. */
   static async open(filePath: string): Promise<JsonFileStore> {
-    let db = emptyDb();
+    let raw: string;
     try {
-      const raw = await readFile(filePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<Db>;
-      db = { ...emptyDb(), ...parsed } as Db;
-    } catch {
-      // missing or unreadable file -> start fresh (parent dir created on write)
+      raw = await readFile(filePath, "utf8");
+    } catch (err) {
+      // No file yet is the normal first-run case; start fresh (the parent dir
+      // is created on the first write).
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return new JsonFileStore(filePath, emptyDb());
+      }
+      // Permission / I/O errors must NOT be mistaken for "empty" — doing so
+      // would let the next write clobber recoverable history. Fail loud.
+      throw err;
     }
-    return new JsonFileStore(filePath, db);
+
+    let parsed: Partial<Db>;
+    try {
+      parsed = JSON.parse(raw) as Partial<Db>;
+    } catch (err) {
+      // The file exists but isn't valid JSON. Leave it untouched for recovery
+      // and refuse to start rather than overwrite it with an empty DB.
+      throw new Error(
+        `Loopwright store at ${filePath} is not valid JSON; left untouched for ` +
+          `recovery (move or delete it to start fresh): ${(err as Error).message}`,
+      );
+    }
+    return new JsonFileStore(filePath, { ...emptyDb(), ...parsed } as Db);
   }
 
   protected persist(): Promise<void> {

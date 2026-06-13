@@ -305,14 +305,19 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     const tappedStore = tapStoreEvents(store, (rec) => hub.publish(sessionId, "event", rec));
 
     activeRuns += 1;
+    // Begin a fresh hub channel for this run: discards any retained buffer from
+    // a previous run that reused this session id (so the stream can't replay
+    // stale events) and yields a generation token for the cleanup guard below.
+    const generation = hub.start(sessionId);
     hub.publish(sessionId, "status", { phase: "running" } satisfies RunStatusData);
 
     // Frees the active-run slot and, after a grace period, releases the run's
     // in-memory event buffer (late viewers can still catch up until then; the
-    // durable trace remains available from the store afterwards).
+    // durable trace remains available from the store afterwards). The
+    // generation guard ensures this never drops a newer run on the same id.
     const settle = (): void => {
       activeRuns = Math.max(0, activeRuns - 1);
-      const timer = setTimeout(() => hub.forget(sessionId), retainMs);
+      const timer = setTimeout(() => hub.forget(sessionId, generation), retainMs);
       if (typeof timer.unref === "function") timer.unref();
     };
 
@@ -415,7 +420,9 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       const html = await readFile(file, "utf8");
       const tag = `<script>window.__LOOPWRIGHT_TOKEN__=${JSON.stringify(token)}</script>`;
       const injected = html.includes("</head>") ? html.replace("</head>", `${tag}</head>`) : tag + html;
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      // index.html carries the live API token, so it must never be cached to
+      // disk (hashed asset files below can still cache normally).
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       res.end(injected);
       return;
     }

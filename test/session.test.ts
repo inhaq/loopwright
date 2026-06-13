@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runGoal, openBlockers } from "../src/session.js";
+import { runGoal, openBlockers, finalSessionStatus } from "../src/session.js";
 import { loadConfig } from "../src/config.js";
 import { MockRunner } from "../src/runners/mockRunner.js";
 import type { AgentRunner, RunnerProfile, RunRequest } from "../src/runners/agentRunner.js";
@@ -115,5 +115,22 @@ describe("runGoal end-to-end", () => {
       // no actor/critic runner bound
     });
     await expect(runGoal("g", config, { executor: okExecutor })).rejects.toThrow();
+  });
+});
+
+describe("finalSessionStatus", () => {
+  it("is completed only when nothing needs a human and integration (if any) is ok", () => {
+    expect(finalSessionStatus(0)).toBe("completed");
+    expect(finalSessionStatus(0, { ok: true })).toBe("completed");
+  });
+
+  it("is needs_human when a task needs attention", () => {
+    expect(finalSessionStatus(2)).toBe("needs_human");
+  });
+
+  it("is needs_human when integration failed, even with no task blockers", () => {
+    // A clean per-task run that fails to integrate (conflicts / failed verify)
+    // must not be reported as completed.
+    expect(finalSessionStatus(0, { ok: false })).toBe("needs_human");
   });
 });

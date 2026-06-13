@@ -13,7 +13,7 @@ import { integrate, type IntegrationResult } from "./engine/integrator.js";
 import { GitWorktreeManager } from "./workspace/worktrees.js";
 import type { IntegrationBranch } from "./engine/integrator.js";
 import type { CommandExecutor } from "./engine/mechanicalGate.js";
-import type { Store } from "./storage/store.js";
+import type { Store, SessionStatus } from "./storage/store.js";
 import { storeObserver, combineObservers } from "./storage/checkpoint.js";
 import type { RunnerCallSink } from "./observability/instrument.js";
 import { EVENT_TYPES } from "./observability/events.js";
@@ -220,9 +220,6 @@ export async function runGoal(
   }
 
   if (store && sessionId) {
-    await store.updateSession(sessionId, {
-      status: needsHuman.length > 0 ? "needs_human" : "completed",
-    });
     await store.recordEvent({
       sessionId,
       at: new Date().toISOString(),
@@ -261,6 +258,29 @@ export async function runGoal(
     for (const wt of wtManager.list()) await wtManager.release(wt.taskId);
   }
 
+  // Durable final status is decided LAST, so an integration that surfaced
+  // conflicts or failed verification (integration.ok === false) marks the
+  // session needs_human rather than leaving the earlier "completed" optimism.
+  if (store && sessionId) {
+    if (integration) {
+      await store.recordEvent({
+        sessionId,
+        at: new Date().toISOString(),
+        type: EVENT_TYPES.integration,
+        data: {
+          ok: integration.ok,
+          merged: integration.merged,
+          conflicts: integration.conflicts,
+          integrationBranch: integration.integrationBranch,
+          verification: integration.verification ?? null,
+        },
+      });
+    }
+    await store.updateSession(sessionId, {
+      status: finalSessionStatus(needsHuman.length, integration),
+    });
+  }
+
   return {
     goal,
     ...(sessionId ? { sessionId } : {}),
@@ -273,6 +293,20 @@ export async function runGoal(
     allVerified: green.length === plan.plan.tasks.length,
     ...(integration ? { integration } : {}),
   };
+}
+
+/**
+ * Decides the durable final session status. Integration that surfaced conflicts
+ * or failed verification (integration.ok === false) is blocking and downgrades
+ * an otherwise-complete session to needs_human.
+ */
+export function finalSessionStatus(
+  needsHumanCount: number,
+  integration?: { ok: boolean },
+): SessionStatus {
+  if (needsHumanCount > 0) return "needs_human";
+  if (integration && !integration.ok) return "needs_human";
+  return "completed";
 }
 
 /** Flattens a session's still-open blocking findings for reporting. */

@@ -37,6 +37,7 @@ export const EVENT_TYPES = {
   planReviewed: "plan_reviewed",
   runnerCall: "runner_call",
   sessionFinished: "session_finished",
+  integration: "integration",
 } as const;
 
 function num(v: unknown): number {

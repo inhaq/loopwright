@@ -244,8 +244,46 @@ describe("server: static assets", () => {
     const res = await fetch(`${base}/`, { headers: { origin: "http://localhost:9999" } });
     expect(res.status).toBe(200);
     expect(res.headers.get("access-control-allow-origin")).toBeNull();
+    // Token-bearing HTML must not be cached.
+    expect(res.headers.get("cache-control")).toBe("no-store");
     const html = await res.text();
     expect(html).toContain(`window.__LOOPWRIGHT_TOKEN__="${TOKEN}"`);
+  });
+});
+
+describe("server: session id reuse", () => {
+  beforeEach(() => startServer());
+
+  it("does not replay a previous run's events when a finished id is reused", async () => {
+    const sid = "reused-session";
+
+    // Run 1 to completion on the fixed id.
+    const r1 = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: auth({ "content-type": "application/json" }),
+      body: JSON.stringify({ goal: "first", sessionId: sid }),
+    });
+    expect(r1.status).toBe(202);
+    const s1 = await fetch(`${base}/api/runs/${sid}/stream`, { headers: auth() });
+    await readSse(s1, (m) => m.some((x) => x.event === "status" && x.data.phase === "done"));
+
+    // Run 2 reuses the id (allowed now that run 1 is finished).
+    const r2 = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: auth({ "content-type": "application/json" }),
+      body: JSON.stringify({ goal: "second", sessionId: sid }),
+    });
+    expect(r2.status).toBe(202);
+
+    const s2 = await fetch(`${base}/api/runs/${sid}/stream`, { headers: auth() });
+    const msgs = await readSse(s2, (m) => m.some((x) => x.event === "status" && x.data.phase === "done"));
+
+    // Fresh channel: ids restart at 0, the first event is run 2 going running,
+    // and there is exactly one terminal "done" (no stale run-1 done replayed).
+    expect(msgs[0]!.id).toBe(0);
+    expect(msgs[0]!.event).toBe("status");
+    expect(msgs[0]!.data.phase).toBe("running");
+    expect(msgs.filter((m) => m.event === "status" && m.data.phase === "done").length).toBe(1);
   });
 });
 
