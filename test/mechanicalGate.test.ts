@@ -3,6 +3,18 @@ import { runMechanicalGate, createShellExecutor, TIMEOUT_EXIT_CODE } from "../sr
 import { scriptedExecutor } from "../src/adapters/mocks.js";
 
 describe("mechanical gate", () => {
+  it("kills a running command when the abort signal fires", async () => {
+    const exec = createShellExecutor();
+    const ac = new AbortController();
+    const started = Date.now();
+    const p = exec("sleep 5", ".", ac.signal);
+    setTimeout(() => ac.abort(), 20);
+    const out = await p;
+    // Cancelled, not run to completion: non-zero and well under the 5s sleep.
+    expect(out.exitCode).not.toBe(0);
+    expect(Date.now() - started).toBeLessThan(4000);
+  });
+
   it("passes when all commands succeed", async () => {
     const exec = scriptedExecutor(() => ({ exitCode: 0, output: "ok" }));
     const r = await runMechanicalGate(["npm run build", "npm test"], { cwd: ".", executor: exec });

@@ -49,6 +49,12 @@ export interface RunRequest {
   cwd: string;
   /** optional system/role framing */
   system?: string;
+  /**
+   * Cooperative cancellation. When aborted, an HTTP backend aborts its in-flight
+   * fetch and a CLI backend kills its subprocess tree, so clicking Stop during a
+   * long model call returns promptly instead of waiting for the runner timeout.
+   */
+  signal?: AbortSignal;
 }
 
 export interface RunResult {

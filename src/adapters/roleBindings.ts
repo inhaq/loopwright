@@ -38,6 +38,8 @@ export interface CreateRolesOptions {
   log?: (line: string) => void;
   /** when set, every runner call emits an event attributed to its role (M5) */
   onRunnerCall?: RunnerCallSink;
+  /** cooperative cancellation, threaded into the actor/critic runner calls */
+  signal?: AbortSignal;
 }
 
 function resolveProfile(
@@ -96,12 +98,14 @@ export function createRoles(
     ...(opts.actorPrompts ? { prompts: opts.actorPrompts } : {}),
     ...(opts.cwd ? { cwd: opts.cwd } : {}),
     ...(opts.log ? { log: opts.log } : {}),
+    ...(opts.signal ? { signal: opts.signal } : {}),
   });
 
   const critic = new RunnerCritic(instrumentedCritic, {
     ...(opts.criticPrompts ? { prompts: opts.criticPrompts } : {}),
     ...(opts.cwd ? { cwd: opts.cwd } : {}),
     ...(opts.log ? { log: opts.log } : {}),
+    ...(opts.signal ? { signal: opts.signal } : {}),
   });
 
   return { actor, critic };

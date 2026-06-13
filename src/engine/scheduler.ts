@@ -110,6 +110,29 @@ function isBlocking(result: ScheduledResult | undefined): boolean {
   return !isUnblocking(result);
 }
 
+/** Synthetic terminal outcome for a task whose run threw unexpectedly. */
+function failedTaskOutcome(taskId: string, reason: string): TaskOutcome {
+  return {
+    taskId,
+    finalState: "NEEDS_HUMAN",
+    verified: false,
+    history: [],
+    buildAttempts: 0,
+    reviewCycles: 0,
+    nits: [],
+    unresolvedBlockers: [],
+    degradedReason: reason,
+    lastDiff: "",
+  };
+}
+
+/** An AbortError-shaped error so callers can distinguish cancellation. */
+function abortError(): Error {
+  const e = new Error("run cancelled");
+  e.name = "AbortError";
+  return e;
+}
+
 /**
  * Executes all tasks honoring dependencies + the parallelism cap. Returns one
  * result per task in the input's declared order.
@@ -167,30 +190,52 @@ export async function runScheduledTasks(
       }
     }
 
-    // 2) Launch ready tasks up to the parallelism cap.
-    for (const id of [...remaining]) {
-      if (running.size >= maxParallel) break;
-      const task = byId.get(id) as TaskSpec;
-      if (!depsSatisfied(task)) continue;
-      remaining.delete(id);
-      const cwd = await workspaceFor(task);
-      deps.log?.(`[${id}] START`);
-      running.set(
-        id,
-        runTask(task, { ...deps, cwd }).then((outcome) => ({ id, outcome })),
-      );
+    // 2) Launch ready tasks up to the parallelism cap. Once cancelled, stop
+    //    launching new work; already-running tasks are still drained below.
+    if (!deps.signal?.aborted) {
+      for (const id of [...remaining]) {
+        if (running.size >= maxParallel) break;
+        const task = byId.get(id) as TaskSpec;
+        if (!depsSatisfied(task)) continue;
+        remaining.delete(id);
+        const cwd = await workspaceFor(task);
+        deps.log?.(`[${id}] START`);
+        // The run is wrapped so it never rejects: an unexpected throw becomes a
+        // NEEDS_HUMAN result for THAT task, so one task can't reject the
+        // Promise.race and abandon its still-running siblings (which would let
+        // worktree cleanup race live tasks).
+        running.set(
+          id,
+          runTask(task, { ...deps, cwd })
+            .then((outcome) => ({ id, outcome }))
+            .catch((err) => ({
+              id,
+              outcome: failedTaskOutcome(
+                id,
+                `Task failed unexpectedly: ${String((err as Error)?.message ?? err)}`,
+              ),
+            })),
+        );
+      }
     }
 
     // 3) Nothing running and nothing launchable: all work is resolved.
     if (running.size === 0) break;
 
-    // 4) Wait for the next task to finish, record it, and re-evaluate.
+    // 4) Wait for the next task to finish, record it, and re-evaluate. The
+    //    settle wrapper guarantees this never rejects, so siblings always drain.
     const { id, outcome } = await Promise.race(running.values());
     running.delete(id);
     const r: ScheduledResult = { taskId: id, status: "completed", outcome };
     results.set(id, r);
     deps.log?.(`[${id}] DONE -- ${outcome.finalState}`);
     await deps.onTaskSettled?.(byId.get(id) as TaskSpec, r);
+  }
+
+  // Cancellation surfaces only AFTER all in-flight tasks have drained, so the
+  // caller's worktree/cleanup runs without racing live tasks.
+  if (deps.signal?.aborted) {
+    throw abortError();
   }
 
   return tasks.map(

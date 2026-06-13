@@ -1,0 +1,19 @@
+{
+  "identifier": "default",
+  "description": "Permissions for the main window: core defaults plus permission to spawn the bundled engine sidecar.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "binaries/loopwright-engine",
+          "sidecar": true,
+          "args": false
+        }
+      ]
+    },
+    "shell:allow-kill"
+  ]
+}

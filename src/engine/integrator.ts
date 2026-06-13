@@ -52,6 +52,8 @@ export interface IntegrateInput {
   verifyCommands?: string[];
   /** executor for the verification gate (defaults to the gate's real one) */
   executor?: CommandExecutor;
+  /** cooperative cancellation: skips remaining merges and aborts verification */
+  signal?: AbortSignal;
   git?: GitExec;
   log?: (line: string) => void;
 }
@@ -76,6 +78,12 @@ export async function integrate(input: IntegrateInput): Promise<IntegrationResul
 
   try {
     for (const { taskId, branch } of input.branches) {
+      // Cooperative cancellation: stop merging further branches once cancelled
+      // so a Stop during integration doesn't keep doing merge work.
+      if (input.signal?.aborted) {
+        input.log?.(`integration cancelled before merging ${taskId} (${branch})`);
+        break;
+      }
       try {
         await git(exec, ["merge", "--no-ff", "-m", `integrate ${taskId}`, branch], dir);
         merged.push(taskId);
@@ -98,6 +106,7 @@ export async function integrate(input: IntegrateInput): Promise<IntegrationResul
       verification = await runMechanicalGate(input.verifyCommands, {
         cwd: dir,
         ...(input.executor ? { executor: input.executor } : {}),
+        ...(input.signal ? { signal: input.signal } : {}),
       });
     }
 

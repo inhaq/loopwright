@@ -25,56 +25,70 @@ Each task references the requirement(s) it satisfies.
   _(Req 8)_
 - [x] 11. Test suites: units, behavioral loop scenarios, real-subprocess gate
 
-## Milestone 2 — Runners (in progress)
+## Milestone 2 — Runners (done)
 
-- [~] 12. Generic `CliRunner`: profile-driven subprocess backend (argv
+- [x] 12. Generic `CliRunner`: profile-driven subprocess backend (argv
   templating, stdin/arg prompt, env passthrough, output modes, quota detection,
   timeout, bounded capture, strict option validation) _(Req 8)_
-- [~] 13. Role-binding layer: turn a runner + role prompt templates into a
+- [x] 13. Role-binding layer: turn a runner + role prompt templates into a
   working `Actor` and `Critic` _(Req 8)_
-  - [~] 13.1 Actor prompts: draft plan, build task, fix from feedback
-  - [~] 13.2 Critic prompts: plan review and task review producing rubric JSON
-  - [~] 13.3 Wire role bindings through configuration
-- [~] 14. `HttpRunner` for OpenAI-compatible endpoints (base URL + key + model)
+  - [x] 13.1 Actor prompts: draft plan, build task, fix from feedback
+  - [x] 13.2 Critic prompts: plan review and task review producing rubric JSON
+  - [x] 13.3 Wire role bindings through configuration
+- [x] 14. `HttpRunner` for OpenAI-compatible endpoints (base URL + key + model)
   behind the same interface _(Req 8)_
-- [~] 15. End-to-end run against real runners on a sample goal _(Req 1, 2)_
+- [x] 15. End-to-end run against real runners on a sample goal _(Req 1, 2)_
 
-## Milestone 3 — Persistence and resilience
+## Milestone 3 — Persistence and resilience (done)
 
-- [~] 16. Local store for sessions, tasks, attempts, transitions, outcomes
+- [x] 16. Local store for sessions, tasks, attempts, transitions, outcomes
   _(Req 10, 11)_
-- [~] 17. Checkpoint on each transition; resume a run after interruption
+- [x] 17. Checkpoint on each transition; resume a run after interruption
   _(Req 10)_
-- [~] 18. Stuck-detection watchdog (no-progress threshold) feeding the loop
+- [x] 18. Stuck-detection watchdog (no-progress threshold) feeding the loop
   _(Req 2, 5)_
 
-## Milestone 4 — Parallel execution
+## Milestone 4 — Parallel execution (done)
 
-- [~] 19. Dependency-graph scheduler honoring the parallelism limit _(Req 9)_
-- [~] 20. Isolated workspaces (git worktrees) per concurrent task _(Req 9)_
-- [~] 21. Integrator: merge completed work, run full verification, surface
+- [x] 19. Dependency-graph scheduler honoring the parallelism limit _(Req 9)_
+- [x] 20. Isolated workspaces (git worktrees) per concurrent task _(Req 9)_
+- [x] 21. Integrator: merge completed work, run full verification, surface
   conflicts _(Req 9)_
 
-## Milestone 5 — Observability
+## Milestone 5 — Observability (done)
 
-- [~] 22. Structured event log for transitions and runner calls _(Req 11)_
-- [~] 23. Usage/cost ledger per role and per run _(Req 11)_
-- [~] 24. Session trace inspection _(Req 11)_
+- [x] 22. Structured event log for transitions and runner calls _(Req 11)_
+- [x] 23. Usage/cost ledger per role and per run _(Req 11)_
+- [x] 24. Session trace inspection _(Req 11)_
 
-## Milestone 6 — Desktop delivery
+## Milestone 6 — Desktop delivery (in progress)
 
-- [ ] 25. Desktop shell over the headless engine: start a run, monitor live
+- [~] 25. Desktop shell over the headless engine: start a run, monitor live
   progress, review results _(Req 13)_
-- [ ] 26. Packaging and secure secret storage _(Req 13)_
+  - [~] 25.1 Engine HTTP/SSE server (`src/server/`) wrapping `runGoal` +
+    `buildTrace`; streams live transitions, attempts, outcomes, and runner
+    calls over SSE without adding orchestration policy
+  - [~] 25.2 Tauri shell that runs the engine as a bundled sidecar process and
+    loads the web frontend (Start / Monitor / Results views)
+- [~] 26. Packaging and secure secret storage _(Req 13)_
+  - [~] 26.1 OS-keychain secret storage (Tauri commands backed by `keyring`)
+  - [~] 26.2 Inject stored API keys into the sidecar env so runner `apiKeyEnv`
+    bindings resolve without plaintext on disk
 
 ---
 
 ### Current position
 
-Milestone 1 is complete and merged. Milestone 2 is underway: the generic
-command-line runner is implemented and in review, and the **role-binding layer
-(13)** is now in review — `RunnerActor`/`RunnerCritic` pair any runner with
-prompt templates and are wired through configuration (`createRoles`), so a
-profile + prompts becomes a usable backend driving the Milestone 1 loop. The
-next active task is the **`HttpRunner` (14)** for OpenAI-compatible endpoints,
-followed by an **end-to-end run against real runners (15)**.
+Milestones 1–5 are complete and merged on `main` (engine core, runners +
+role bindings, persistence/resume, the parallel scheduler with git-worktree
+isolation and the integrator, and the observability/usage/trace layer); the
+suite is green (132 tests, `tsc --noEmit` clean).
+
+Active work is **Milestone 6 — Desktop delivery**. Rather than reimplement loop
+logic (forbidden by Req 13), the desktop app reuses the headless engine through
+a thin Node **HTTP/SSE server** (`src/server/`) that wraps `runGoal` and
+`buildTrace`. That server is compiled to a single binary and shipped as a
+**Tauri sidecar**; the Tauri shell hosts the web frontend (start a run, monitor
+live progress over SSE, review the final trace) and stores runner API keys in
+the OS keychain, injecting them into the sidecar's environment so no secret is
+written to disk in plaintext.

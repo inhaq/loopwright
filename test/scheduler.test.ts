@@ -4,6 +4,7 @@ import { loadConfig, type LoopwrightConfig } from "../src/config.js";
 import { MockActor, MockCritic, criticBlock, criticGreen } from "../src/adapters/mocks.js";
 import type { CommandExecutor } from "../src/engine/mechanicalGate.js";
 import type { TaskSpec } from "../src/schemas/plan.js";
+import type { Actor } from "../src/adapters/agents.js";
 
 const task = (id: string, dependencies: string[] = [], verify = ["check"]): TaskSpec => ({
   id,
@@ -141,5 +142,50 @@ describe("runScheduledTasks failure propagation + resume", () => {
     expect(results[0]?.status).toBe("resumed");
     // the gate never ran because the task was reused from the prior outcome
     expect(order).toEqual([]);
+  });
+});
+
+describe("runScheduledTasks fault isolation + cancellation", () => {
+  function actorThrowingOn(badId: string): Actor {
+    return {
+      draftPlan: async () => ({ plan: { goal: "g", tasks: [] } }),
+      build: async (t) => {
+        if (t.id === badId) throw new Error("model exploded");
+        return { diff: "d", touchedFiles: [], summary: "s" };
+      },
+      selfReview: async () => criticGreen(),
+    };
+  }
+
+  it("isolates a throwing task as NEEDS_HUMAN while independent siblings finish", async () => {
+    const { exec } = recordingExecutor();
+    const deps = {
+      actor: actorThrowingOn("boom"),
+      critic: new MockCritic({ fallback: criticGreen() }),
+      config: cfg(2),
+      cwd: ".",
+      executor: exec,
+    };
+    // independent tasks: one task's actor build throws, the other is fine
+    const results = await runScheduledTasks([task("boom"), task("ok")], deps);
+    const byId = Object.fromEntries(results.map((r) => [r.taskId, r]));
+    // the failure is task-fatal (NEEDS_HUMAN), not session-fatal
+    expect(byId.boom?.outcome?.finalState).toBe("NEEDS_HUMAN");
+    expect(byId.boom?.outcome?.degradedReason).toMatch(/actor build failed/i);
+    // the independent sibling still ran to GREEN
+    expect(byId.ok?.outcome?.finalState).toBe("GREEN");
+  });
+
+  it("cancels via AbortSignal, draining in-flight tasks before throwing", async () => {
+    const ac = new AbortController();
+    // a slow gate keeps tasks in-flight so cancellation lands mid-run
+    const slow: CommandExecutor = async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      return { exitCode: 0, output: "", durationMs: 30 };
+    };
+    const deps = { ...greenDeps(cfg(2), slow), signal: ac.signal };
+    const p = runScheduledTasks([task("a"), task("b")], deps);
+    setTimeout(() => ac.abort(), 5);
+    await expect(p).rejects.toThrow(/cancelled/i);
   });
 });

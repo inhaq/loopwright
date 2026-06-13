@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { runGoal, openBlockers } from "../src/session.js";
+import { runGoal, openBlockers, finalSessionStatus, reconcileInterruptedSessions } from "../src/session.js";
 import { loadConfig } from "../src/config.js";
 import { MockRunner } from "../src/runners/mockRunner.js";
 import type { AgentRunner, RunnerProfile, RunRequest } from "../src/runners/agentRunner.js";
 import { criticGreen, criticBlock, scriptedExecutor } from "../src/adapters/mocks.js";
+import { MemoryStore } from "../src/storage/store.js";
 
 /**
  * End-to-end session tests. The whole config -> createRoles -> plan review ->
@@ -115,5 +116,61 @@ describe("runGoal end-to-end", () => {
       // no actor/critic runner bound
     });
     await expect(runGoal("g", config, { executor: okExecutor })).rejects.toThrow();
+  });
+
+  it("persists 'failed' + a failure event when the run throws", async () => {
+    const store = new MemoryStore();
+    const config = configWithMockRoles();
+    // A runner that throws makes plan review (and thus runGoal) reject.
+    const throwingFactory = (profile: RunnerProfile): AgentRunner => ({
+      profile,
+      run: async () => {
+        throw new Error("kaboom");
+      },
+    });
+
+    await expect(
+      runGoal("g", config, { store, factory: throwingFactory, executor: okExecutor }),
+    ).rejects.toThrow(/kaboom/);
+
+    const sessions = await store.listSessions();
+    expect(sessions).toHaveLength(1);
+    // The durable session is terminal (failed), not stuck "running".
+    expect(sessions[0]!.status).toBe("failed");
+    const events = await store.listEvents(sessions[0]!.id);
+    expect(events.some((e) => e.type === "session_failed")).toBe(true);
+  });
+});
+
+describe("finalSessionStatus", () => {
+  it("is completed only when nothing needs a human and integration (if any) is ok", () => {
+    expect(finalSessionStatus(0)).toBe("completed");
+    expect(finalSessionStatus(0, { ok: true })).toBe("completed");
+  });
+
+  it("is needs_human when a task needs attention", () => {
+    expect(finalSessionStatus(2)).toBe("needs_human");
+  });
+
+  it("is needs_human when integration failed, even with no task blockers", () => {
+    // A clean per-task run that fails to integrate (conflicts / failed verify)
+    // must not be reported as completed.
+    expect(finalSessionStatus(0, { ok: false })).toBe("needs_human");
+  });
+});
+
+describe("reconcileInterruptedSessions", () => {
+  it("marks orphaned running sessions as failed with an event", async () => {
+    const store = new MemoryStore();
+    const now = new Date().toISOString();
+    await store.createSession({ id: "stuck", goal: "g", createdAt: now, updatedAt: now, status: "running" });
+    await store.createSession({ id: "ok", goal: "g", createdAt: now, updatedAt: now, status: "completed" });
+
+    const n = await reconcileInterruptedSessions(store);
+    expect(n).toBe(1);
+    expect((await store.getSession("stuck"))?.status).toBe("failed");
+    expect((await store.getSession("ok"))?.status).toBe("completed"); // untouched
+    const events = await store.listEvents("stuck");
+    expect(events.some((e) => e.type === "session_interrupted")).toBe(true);
   });
 });

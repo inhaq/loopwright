@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { MemoryStore, JsonFileStore, openStore } from "../src/storage/store.js";
 import type { TaskOutcome } from "../src/engine/loop.js";
 
@@ -104,6 +104,17 @@ describe("JsonFileStore", () => {
     expect((await reopened.getSession("s1"))?.goal).toBe("ship");
     expect((await reopened.getOutcome("s1", "t1"))?.verified).toBe(true);
     expect((await reopened.getTask("s1", "t1"))?.state).toBe("GREEN");
+  });
+
+  it("refuses to open a corrupt store and leaves the file untouched", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "loopwright-store-"));
+    const file = join(dir, "sessions.db");
+    await writeFile(file, "{ this is not json");
+
+    // Fails loud instead of silently starting empty (which would clobber it).
+    await expect(JsonFileStore.open(file)).rejects.toThrow(/not valid JSON/);
+    // The unreadable file is preserved as-is for recovery.
+    expect(await readFile(file, "utf8")).toBe("{ this is not json");
   });
 
   it("serializes concurrent writes without corrupting the file", async () => {

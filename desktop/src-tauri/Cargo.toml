@@ -1,0 +1,27 @@
+[package]
+name = "loopwright-desktop"
+version = "0.1.0"
+description = "Desktop shell for the Loopwright actor-critic engine"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "loopwright_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# Used directly for the sidecar-startup read timeout (tauri's async runtime is
+# tokio, but a transitive dep is not usable directly).
+tokio = { version = "1", features = ["time"] }
+
+[features]
+# default to a production build without devtools
+custom-protocol = ["tauri/custom-protocol"]

@@ -24,6 +24,7 @@ export interface CommandOutcome {
 export type CommandExecutor = (
   command: string,
   cwd: string,
+  signal?: AbortSignal,
 ) => Promise<CommandOutcome>;
 
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
@@ -50,12 +51,21 @@ export function createShellExecutor(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxChars = opts.maxCapturedChars ?? DEFAULT_MAX_CAPTURED_CHARS;
 
-  return (command, cwd) =>
+  return (command, cwd, signal) =>
     new Promise((resolve) => {
       const started = Date.now();
+      // If already cancelled, don't even spawn.
+      if (signal?.aborted) {
+        resolve({ exitCode: TIMEOUT_EXIT_CODE, output: "[cancelled]", durationMs: 0 });
+        return;
+      }
+      // Spawn detached on POSIX so the timeout/cancellation handlers can kill
+      // the entire process group, not just the immediate shell. See
+      // killProcessTree / detachForTreeKill.
       const child = spawn(command, { cwd, shell: true, detached: detachForTreeKill });
       let output = "";
       let timedOut = false;
+      let cancelled = false;
 
       const append = (buf: Buffer) => {
         output += buf.toString();
@@ -67,10 +77,23 @@ export function createShellExecutor(
         killProcessTree(child);
       }, timeoutMs);
 
+      // Cancellation: kill the whole process tree so a long verify/build
+      // command (and any descendants it spawned, e.g. `npm test`) stops
+      // promptly when the run is cancelled.
+      const onAbort = (): void => {
+        cancelled = true;
+        killProcessTree(child);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+
       child.stdout.on("data", append);
       child.stderr.on("data", append);
       child.on("error", (err) => {
-        clearTimeout(timer);
+        cleanup();
         resolve({
           exitCode: 127,
           output: `${output}\n${err.message}`,
@@ -78,12 +101,14 @@ export function createShellExecutor(
         });
       });
       child.on("close", (code) => {
-        clearTimeout(timer);
+        cleanup();
         resolve({
-          exitCode: timedOut ? TIMEOUT_EXIT_CODE : (code ?? 1),
+          exitCode: timedOut || cancelled ? TIMEOUT_EXIT_CODE : (code ?? 1),
           output: timedOut
             ? `${output}\n[killed: exceeded ${timeoutMs}ms timeout]`
-            : output,
+            : cancelled
+              ? `${output}\n[killed: run cancelled]`
+              : output,
           durationMs: Date.now() - started,
         });
       });
@@ -96,6 +121,8 @@ export const defaultExecutor: CommandExecutor = createShellExecutor();
 export interface MechanicalGateOptions {
   cwd: string;
   executor?: CommandExecutor;
+  /** cancels in-flight commands when aborted */
+  signal?: AbortSignal;
 }
 
 /**
@@ -118,7 +145,7 @@ export async function runMechanicalGate(
   }
 
   for (const command of commands) {
-    const outcome = await executor(command, opts.cwd);
+    const outcome = await executor(command, opts.cwd, opts.signal);
     const passed = outcome.exitCode === 0;
     steps.push({
       command,
