@@ -30,11 +30,11 @@ Each task references the requirement(s) it satisfies.
 - [~] 12. Generic `CliRunner`: profile-driven subprocess backend (argv
   templating, stdin/arg prompt, env passthrough, output modes, quota detection,
   timeout, bounded capture, strict option validation) _(Req 8)_
-- [ ] 13. Role-binding layer: turn a runner + role prompt templates into a
+- [~] 13. Role-binding layer: turn a runner + role prompt templates into a
   working `Actor` and `Critic` _(Req 8)_
-  - [ ] 13.1 Actor prompts: draft plan, build task, fix from feedback
-  - [ ] 13.2 Critic prompts: plan review and task review producing rubric JSON
-  - [ ] 13.3 Wire role bindings through configuration
+  - [~] 13.1 Actor prompts: draft plan, build task, fix from feedback
+  - [~] 13.2 Critic prompts: plan review and task review producing rubric JSON
+  - [~] 13.3 Wire role bindings through configuration
 - [ ] 14. `HttpRunner` for OpenAI-compatible endpoints (base URL + key + model)
   behind the same interface _(Req 8)_
 - [ ] 15. End-to-end run against real runners on a sample goal _(Req 1, 2)_
@@ -72,6 +72,9 @@ Each task references the requirement(s) it satisfies.
 ### Current position
 
 Milestone 1 is complete and merged. Milestone 2 is underway: the generic
-command-line runner is implemented and in review; the next active task is the
-**role-binding layer (13)** that connects runners to the actor/critic roles so
-real backends drive the loop built in Milestone 1.
+command-line runner is implemented and in review, and the **role-binding layer
+(13)** is now in review — `RunnerActor`/`RunnerCritic` pair any runner with
+prompt templates and are wired through configuration (`createRoles`), so a
+profile + prompts becomes a usable backend driving the Milestone 1 loop. The
+next active task is the **`HttpRunner` (14)** for OpenAI-compatible endpoints,
+followed by an **end-to-end run against real runners (15)**.
