@@ -1,16 +1,17 @@
 import { randomUUID } from "node:crypto";
 import type { LoopwrightConfig } from "./config.js";
-import type { TaskSpec } from "./schemas/plan.js";
-import type { TaskState } from "./domain/stateMachine.js";
 import type { Finding } from "./schemas/critic.js";
 import { createRoles, type CreateRolesOptions } from "./adapters/roleBindings.js";
 import {
   runPlanReview,
-  runTask,
   type LoopObserver,
   type PlanOutcome,
   type TaskOutcome,
 } from "./engine/loop.js";
+import { runScheduledTasks, type SchedulerDeps } from "./engine/scheduler.js";
+import { integrate, type IntegrationResult } from "./engine/integrator.js";
+import { GitWorktreeManager } from "./workspace/worktrees.js";
+import type { IntegrationBranch } from "./engine/integrator.js";
 import type { CommandExecutor } from "./engine/mechanicalGate.js";
 import type { Store } from "./storage/store.js";
 import { storeObserver, combineObservers } from "./storage/checkpoint.js";
@@ -18,13 +19,13 @@ import { storeObserver, combineObservers } from "./storage/checkpoint.js";
 /**
  * End-to-end run (Task 15): goal -> reviewed plan -> per-task actor-critic loop
  * -> session summary. This is the headless entrypoint a CLI or desktop shell
- * calls; it ties configuration, the role-binding layer, and the Milestone 1
- * loop together without adding any new orchestration policy.
+ * calls; it ties configuration, the role-binding layer, persistence, and the
+ * loop together without adding new orchestration policy.
  *
- * Tasks execute sequentially in dependency order here; a dependent is SKIPPED
- * when a prerequisite did not reach a usable terminal state. Bounded concurrency
- * and isolated worktrees arrive in Milestone 4 and will slot in behind this same
- * entrypoint.
+ * Task execution is delegated to the dependency-graph scheduler (Task 19), so
+ * independent tasks run concurrently up to `config.maxParallel`, dependents
+ * wait for (and are skipped on) unsatisfied prerequisites, and completed tasks
+ * are reused on resume.
  */
 
 export type SessionTaskStatus = "completed" | "skipped" | "resumed";
@@ -51,6 +52,8 @@ export interface SessionResult {
   skipped: string[];
   /** true only when every task reached a verified GREEN */
   allVerified: boolean;
+  /** present when worktrees were used: merge + full-verification result */
+  integration?: IntegrationResult;
 }
 
 export interface RunGoalOptions extends CreateRolesOptions {
@@ -64,43 +67,16 @@ export interface RunGoalOptions extends CreateRolesOptions {
   resume?: boolean;
   /** extra observer composed with the store checkpointer (e.g. event log) */
   observer?: LoopObserver;
-}
-
-/** Terminal task states that allow dependents to proceed (see scheduler, M4). */
-function isUnblockingState(state: TaskState): boolean {
-  return state === "GREEN" || state === "UNVERIFIED_BY_CRITIC";
-}
-
-function isUnblocking(outcome: TaskOutcome | undefined): boolean {
-  return outcome !== undefined && isUnblockingState(outcome.finalState);
-}
-
-/** Orders tasks so dependencies precede dependents (stable; rejects cycles). */
-function dependencyOrder(tasks: TaskSpec[]): TaskSpec[] {
-  const byId = new Map(tasks.map((t) => [t.id, t]));
-  const visited = new Set<string>();
-  const ordered: TaskSpec[] = [];
-  const visit = (task: TaskSpec, stack: string[]): void => {
-    if (visited.has(task.id)) return;
-    if (stack.includes(task.id)) {
-      // A back-edge means the plan's dependency graph is cyclic and cannot be
-      // scheduled. Fail loudly with the offending cycle rather than silently
-      // dropping the edge (which would yield a partial order and cascading
-      // skips); plans are expected to be acyclic (enforced in critic review).
-      const cycle = [...stack.slice(stack.indexOf(task.id)), task.id].join(" -> ");
-      throw new Error(`Plan dependency cycle detected: ${cycle}`);
-    }
-    stack.push(task.id);
-    for (const depId of task.dependencies) {
-      const dep = byId.get(depId);
-      if (dep) visit(dep, stack);
-    }
-    stack.pop();
-    visited.add(task.id);
-    ordered.push(task);
-  };
-  for (const t of tasks) visit(t, []);
-  return ordered;
+  /** per-task working directory provider (git worktrees, Task 20) */
+  workspaceFor?: SchedulerDeps["workspaceFor"];
+  /** called after each task settles (e.g. worktree teardown, Task 20) */
+  onTaskSettled?: SchedulerDeps["onTaskSettled"];
+  /**
+   * When set (and config.useWorktrees), each task builds in an isolated git
+   * worktree off this repo and the resulting branches are integrated + verified
+   * after the run (Tasks 20, 21).
+   */
+  repoDir?: string;
 }
 
 export async function runGoal(
@@ -108,8 +84,17 @@ export async function runGoal(
   config: LoopwrightConfig,
   opts: RunGoalOptions = {},
 ): Promise<SessionResult> {
-  const { executor, store, sessionId: sessionIdOpt, resume, observer: extraObserver, ...roleOpts } =
-    opts;
+  const {
+    executor,
+    store,
+    sessionId: sessionIdOpt,
+    resume,
+    observer: extraObserver,
+    workspaceFor,
+    onTaskSettled,
+    repoDir,
+    ...roleOpts
+  } = opts;
   const { actor, critic } = createRoles(config, roleOpts);
   const cwd = opts.cwd ?? ".";
 
@@ -153,44 +138,50 @@ export async function runGoal(
     });
   }
 
-  const outcomes = new Map<string, TaskOutcome>();
-  const results: SessionTaskResult[] = [];
+  // Isolated worktrees + integration (Tasks 20, 21), opt-in via repoDir. Each
+  // task builds in its own git worktree; on success its changes are committed
+  // on a per-task branch for the integrator to merge after the run.
+  const useWorktrees = Boolean(repoDir) && config.useWorktrees;
+  const wtManager = useWorktrees
+    ? new GitWorktreeManager({ repoDir: repoDir as string, sessionId: sessionId ?? randomUUID() })
+    : undefined;
+  const greenBranches: IntegrationBranch[] = [];
 
-  for (const task of dependencyOrder(plan.plan.tasks)) {
-    // Resume: a task already completed (GREEN/unverified) in a prior run is
-    // reused as-is, so an interrupted run doesn't repeat finished work.
-    if (resume && store && sessionId) {
-      const prior = await store.getOutcome(sessionId, task.id);
-      if (prior && isUnblockingState(prior.finalState)) {
-        outcomes.set(task.id, prior.outcome);
-        results.push({ taskId: task.id, status: "resumed", outcome: prior.outcome });
-        opts.log?.(`[${task.id}] RESUMED -- ${prior.finalState} (skipped rebuild)`);
-        continue;
+  const schedulerExtra: Partial<SchedulerDeps> = {};
+  if (wtManager) {
+    schedulerExtra.workspaceFor = async (t) => (await wtManager.acquire(t.id)).path;
+    schedulerExtra.onTaskSettled = async (t, r) => {
+      const unblocking =
+        r.outcome?.finalState === "GREEN" || r.outcome?.finalState === "UNVERIFIED_BY_CRITIC";
+      if (r.status === "completed" && unblocking) {
+        const { committed } = await wtManager.commit(t.id, `loopwright(${t.id}): ${t.title}`);
+        const branch = wtManager.branchFor(t.id);
+        if (committed && branch) greenBranches.push({ taskId: t.id, branch });
+      } else if (r.status !== "resumed") {
+        await wtManager.release(t.id, { deleteBranch: true });
       }
-    }
-
-    const blockedBy = task.dependencies.filter((d) => !isUnblocking(outcomes.get(d)));
-    if (blockedBy.length > 0) {
-      results.push({ taskId: task.id, status: "skipped", blockedBy });
-      opts.log?.(`[${task.id}] SKIPPED -- blocked by ${blockedBy.join(", ")}`);
-      continue;
-    }
-    const outcome = await runTask(task, baseDeps);
-    outcomes.set(task.id, outcome);
-    results.push({ taskId: task.id, status: "completed", outcome });
+    };
+  } else {
+    if (workspaceFor) schedulerExtra.workspaceFor = workspaceFor;
+    if (onTaskSettled) schedulerExtra.onTaskSettled = onTaskSettled;
   }
 
-  // Summaries in the plan's declared order for stable, readable output.
-  const ordered = plan.plan.tasks.map(
-    (t) => results.find((r) => r.taskId === t.id) as SessionTaskResult,
-  );
+  // The scheduler owns ordering, the parallelism cap, dependency-failure
+  // propagation, and (via resumeOutcome) reuse of completed tasks.
+  const results = await runScheduledTasks(plan.plan.tasks, {
+    ...baseDeps,
+    ...schedulerExtra,
+    ...(resume && store && sessionId
+      ? { resumeOutcome: async (t) => (await store.getOutcome(sessionId, t.id))?.outcome }
+      : {}),
+  });
 
   const green: string[] = [];
   const unverified: string[] = [];
   const needsHuman: string[] = [];
   const skipped: string[] = [];
 
-  for (const r of ordered) {
+  for (const r of results) {
     if (r.status === "skipped") skipped.push(r.taskId);
     else if (r.outcome?.finalState === "GREEN") green.push(r.taskId);
     else if (r.outcome?.finalState === "UNVERIFIED_BY_CRITIC") unverified.push(r.taskId);
@@ -203,16 +194,41 @@ export async function runGoal(
     });
   }
 
+  // Integrate the per-task branches and run full verification on the result.
+  let integration: IntegrationResult | undefined;
+  if (wtManager) {
+    if (greenBranches.length > 0) {
+      const branchTaskIds = new Set(greenBranches.map((b) => b.taskId));
+      const verifyCommands = [
+        ...new Set(
+          plan.plan.tasks
+            .filter((t) => branchTaskIds.has(t.id))
+            .flatMap((t) => t.verifyCommands),
+        ),
+      ];
+      integration = await integrate({
+        repoDir: repoDir as string,
+        branches: greenBranches,
+        ...(verifyCommands.length ? { verifyCommands } : {}),
+        ...(executor ? { executor } : {}),
+        ...(opts.log ? { log: opts.log } : {}),
+      });
+    }
+    // Tear down any worktrees kept for integration.
+    for (const wt of wtManager.list()) await wtManager.release(wt.taskId);
+  }
+
   return {
     goal,
     ...(sessionId ? { sessionId } : {}),
     plan,
-    results: ordered,
+    results,
     green,
     unverified,
     needsHuman,
     skipped,
     allVerified: green.length === plan.plan.tasks.length,
+    ...(integration ? { integration } : {}),
   };
 }
 
