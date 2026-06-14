@@ -181,6 +181,7 @@ function renderStart(): void {
   // -- Goal field
   const goalField = h("div", { class: "field" });
   const goalArea = h("textarea", {
+    id: "start-goal",
     name: "goal",
     rows: "3",
     placeholder: "e.g. Add a /healthz endpoint that returns 200 and write a test for it",
@@ -196,7 +197,7 @@ function renderStart(): void {
     chips.append(chip);
   }
   goalField.append(
-    h("div", { class: "label" }, ["Goal"]),
+    h("label", { class: "label", for: "start-goal" }, ["Goal"]),
     h("div", { class: "desc" }, ["What should the agents accomplish? Be specific about the outcome you expect."]),
     goalArea,
     chips,
@@ -204,11 +205,11 @@ function renderStart(): void {
 
   // -- Model / runner field
   const runnerField = h("div", { class: "field" });
-  const presetSelect = h("select", { name: "preset" }) as HTMLSelectElement;
+  const presetSelect = h("select", { id: "start-preset", name: "preset" }) as HTMLSelectElement;
   for (const [key, p] of Object.entries(PRESETS)) {
     presetSelect.append(h("option", { value: key }, [p.label]));
   }
-  const runnersArea = h("textarea", { name: "runners", rows: "10", spellcheck: "false", class: "mono" }) as HTMLTextAreaElement;
+  const runnersArea = h("textarea", { name: "runners", rows: "10", spellcheck: "false", class: "mono", "aria-label": "Runner profiles (JSON)" }) as HTMLTextAreaElement;
   runnersArea.value = PRESETS.openai!.json;
 
   const advanced = h("details", { class: "advanced" });
@@ -232,7 +233,7 @@ function renderStart(): void {
   });
 
   runnerField.append(
-    h("div", { class: "label" }, ["Model provider"]),
+    h("label", { class: "label", for: "start-preset" }, ["Model provider"]),
     h("div", { class: "desc" }, ["Pick a preset to get started, or open Advanced to define your own runner profiles."]),
     presetSelect,
     advanced,
@@ -275,7 +276,7 @@ function renderStart(): void {
   const options = h("div", { class: "options" });
 
   function optionRow(name: string, title: string, desc: string, checked: boolean): HTMLElement {
-    const input = h("input", { type: "checkbox", name }) as HTMLInputElement;
+    const input = h("input", { type: "checkbox", name, "aria-label": title }) as HTMLInputElement;
     if (checked) input.checked = true;
     return h("div", { class: "option" }, [
       h("div", { class: "option-text" }, [h("strong", {}, [title]), h("span", {}, [desc])]),
@@ -284,7 +285,7 @@ function renderStart(): void {
   }
 
   // Max parallel stepper
-  const parallelInput = h("input", { type: "number", name: "maxParallel", min: "1", value: "2" }) as HTMLInputElement;
+  const parallelInput = h("input", { type: "number", name: "maxParallel", min: "1", value: "2", "aria-label": "Max parallel tasks" }) as HTMLInputElement;
   const dec = h("button", { type: "button", "aria-label": "decrease" }, [icon("<path d='M5 12h14'/>")]);
   const inc = h("button", { type: "button", "aria-label": "increase" }, [icon("<path d='M12 5v14'/><path d='M5 12h14'/>")]);
   dec.addEventListener("click", () => { parallelInput.value = String(Math.max(1, Number(parallelInput.value || "1") - 1)); });
@@ -764,14 +765,27 @@ async function renderSecrets(): Promise<void> {
 
   async function refresh(): Promise<void> {
     listEl.innerHTML = "";
-    const keys = await listSecretKeys();
+    let keys: string[];
+    try {
+      keys = await listSecretKeys();
+    } catch (err) {
+      formError.textContent = `Failed to load secrets: ${(err as Error).message}`;
+      formError.hidden = false;
+      return;
+    }
+    formError.hidden = true;
     if (!keys.length) listEl.append(h("li", { class: "hint" }, ["No secrets stored yet."]));
     for (const k of keys) {
       const del = h("button", { class: "danger small" }, ["Delete"]);
       del.addEventListener("click", async () => {
-        await deleteSecret(k);
-        await refresh();
-        markPending();
+        try {
+          await deleteSecret(k);
+          await refresh();
+          markPending();
+        } catch (err) {
+          formError.textContent = `Failed to delete ${k}: ${(err as Error).message}`;
+          formError.hidden = false;
+        }
       });
       listEl.append(h("li", {}, [icon(ICONS.key), h("code", {}, [k]), del]));
     }
