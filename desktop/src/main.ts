@@ -590,7 +590,8 @@ async function renderModels(): Promise<void> {
   const dec = h("button", { type: "button", "aria-label": "decrease" }, [icon("<path d='M5 12h14'/>")]);
   const inc = h("button", { type: "button", "aria-label": "increase" }, [icon("<path d='M12 5v14'/><path d='M5 12h14'/>")]);
   const commitParallel = (): void => {
-    settings.maxParallel = Math.max(1, Number(parallelInput.value || "1"));
+    const parsed = Number(parallelInput.value);
+    settings.maxParallel = Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : 1;
     parallelInput.value = String(settings.maxParallel);
     persist();
   };

@@ -223,6 +223,31 @@ export function loadSettings(): RunSettings {
       writer: { ...DEFAULT_SETTINGS.writer, ...(parsed.writer ?? {}) },
       reviewer: { ...DEFAULT_SETTINGS.reviewer, ...(parsed.reviewer ?? {}) },
     };
+    // Coerce persisted scalars: tampered or legacy localStorage could hold the
+    // wrong type (e.g. maxParallel "abc", worktrees null), which would otherwise
+    // flow into buildRunEnv() and fail run startup with invalid config.
+    const str = (v: unknown, d: string): string => (typeof v === "string" ? v : d);
+    const bool = (v: unknown, d: boolean): boolean => (typeof v === "boolean" ? v : d);
+    merged.repo = str(merged.repo, DEFAULT_SETTINGS.repo);
+    merged.maxParallel =
+      Number.isFinite(merged.maxParallel) && merged.maxParallel >= 1
+        ? Math.floor(merged.maxParallel)
+        : DEFAULT_SETTINGS.maxParallel;
+    merged.worktrees = bool(merged.worktrees, DEFAULT_SETTINGS.worktrees);
+    merged.mechanicalGate = bool(merged.mechanicalGate, DEFAULT_SETTINGS.mechanicalGate);
+    merged.branchPrefix = str(merged.branchPrefix, DEFAULT_SETTINGS.branchPrefix);
+    merged.dryRun = bool(merged.dryRun, DEFAULT_SETTINGS.dryRun);
+    merged.pushToRemote = bool(merged.pushToRemote, DEFAULT_SETTINGS.pushToRemote);
+    merged.remote = str(merged.remote, DEFAULT_SETTINGS.remote);
+    merged.pushBranch = str(merged.pushBranch, DEFAULT_SETTINGS.pushBranch);
+    merged.openPr = bool(merged.openPr, DEFAULT_SETTINGS.openPr);
+    merged.prBase = str(merged.prBase, DEFAULT_SETTINGS.prBase);
+    merged.prTitle = str(merged.prTitle, DEFAULT_SETTINGS.prTitle);
+    merged.prDraft = bool(merged.prDraft, DEFAULT_SETTINGS.prDraft);
+    merged.pushOverride = bool(merged.pushOverride, DEFAULT_SETTINGS.pushOverride);
+    merged.advancedRunners = str(merged.advancedRunners, DEFAULT_SETTINGS.advancedRunners);
+    merged.advancedActor = str(merged.advancedActor, DEFAULT_SETTINGS.advancedActor);
+    merged.advancedCritic = str(merged.advancedCritic, DEFAULT_SETTINGS.advancedCritic);
     // Drop selections that no longer exist in the catalog so the UI never shows
     // a stale/removed model as active.
     if (!findModel(merged.writer)) merged.writer = { ...DEFAULT_SETTINGS.writer };
