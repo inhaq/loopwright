@@ -8,16 +8,17 @@
  *
  * Adding a new backend = implement AgentRunner. Concrete runners are named by
  * their MECHANISM, never by a product/vendor:
- *   - CliRunner   drives a headless command-line agent as a subprocess
- *   - HttpRunner  calls an OpenAI-compatible HTTP endpoint
- *   - MockRunner  deterministic, for tests
+ *   - CliRunner        drives a headless command-line agent as a subprocess
+ *   - HttpRunner       calls an OpenAI-compatible chat-completions endpoint
+ *   - ResponsesRunner  calls the OpenAI Responses API (`/v1/responses`)
+ *   - MockRunner       deterministic, for tests
  * Supporting another provider is usually just a new RunnerProfile; a genuinely
  * new transport is a new runner class. The engine never changes.
  */
 
 import { z } from "zod";
 
-export type RunnerKind = "cli" | "http" | "mock";
+export type RunnerKind = "cli" | "http" | "http-responses" | "mock";
 
 /**
  * Validates a runner profile loaded from configuration. The {@link RunnerProfile}
@@ -27,7 +28,7 @@ export type RunnerKind = "cli" | "http" | "mock";
 export const RunnerProfileSchema = z
   .object({
     id: z.string().min(1),
-    kind: z.enum(["cli", "http", "mock"]),
+    kind: z.enum(["cli", "http", "http-responses", "mock"]),
     model: z.string().default(""),
     options: z.record(z.unknown()).optional(),
   })
