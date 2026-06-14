@@ -1,15 +1,17 @@
 name: Release
 
-# Publishes desktop installers to a GitHub Release. Triggered by pushing a
-# version tag (e.g. v0.1.0); `workflow_dispatch` allows a manual draft build.
+# Publishes direct-download desktop installers to a GitHub Release. Triggered by
+# pushing a version tag (e.g. v0.1.0); `workflow_dispatch` allows a manual draft
+# build for QA.
 #
 # A `gate` job runs the full quality suite (typecheck, tests, audits, cargo
 # test) and, for tag builds, verifies the tag matches every manifest version
 # BEFORE anything is published — so a bad tagged commit cannot produce a
-# release. Code signing / notarization and updater signing are wired through
-# the publish job's env block and activate automatically once the corresponding
-# repository secrets are configured; until then the workflow still uploads
-# unsigned installers as a draft release for QA. See the notes at the bottom.
+# release. This is not an App Store pipeline: it produces downloadable .dmg,
+# .msi/.exe, .deb, and .rpm installers attached to a draft GitHub Release and
+# retained as workflow artifacts. Optional signing/notarization secrets can be
+# added later to reduce OS warnings, but unsigned direct-install builds still
+# publish as draft release assets for QA.
 on:
   push:
     tags: ["v*"]
@@ -168,9 +170,9 @@ jobs:
           - os: ubuntu-latest
             args: "--bundles deb,rpm"
           - os: macos-latest
-            args: ""
+            args: "--bundles dmg"
           - os: windows-latest
-            args: ""
+            args: "--bundles nsis,msi"
 
     steps:
       - name: Checkout
@@ -251,13 +253,18 @@ jobs:
           prerelease: ${{ github.ref_type != 'tag' }}
           args: ${{ matrix.args }}
 
-# Production distribution checklist (requires team-owned credentials/decisions):
-#   - macOS: add APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
-#     APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID secrets
-#     to sign + notarize. Windows: configure a code-signing cert in tauri.conf
-#     (bundle.windows.certificateThumbprint or a signCommand) + secret.
-#   - Confirm the bundle identifier (currently dev.loopwright.desktop) maps to a
-#     domain the org controls before first public release. The keychain service
-#     namespace follows the identifier automatically (see secrets.rs).
-#   - Auto-update: add the tauri updater plugin + endpoints and a signing key
-#     (TAURI_SIGNING_PRIVATE_KEY) to ship update artifacts.
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loopwright-installers-${{ matrix.os }}
+          path: desktop/src-tauri/target/release/bundle/**
+          if-no-files-found: error
+          retention-days: 30
+
+# Direct installer distribution notes:
+#   - Tagged builds create a draft GitHub Release with .dmg, Windows installer,
+#     .deb, and .rpm assets. The Upload installer artifacts step also keeps the
+#     same bundle directory downloadable from the workflow run.
+#   - Unsigned macOS/Windows installers may show Gatekeeper/SmartScreen warnings.
+#     Optional signing/notarization secrets above can reduce those warnings, but
+#     they are not required for direct sharing.

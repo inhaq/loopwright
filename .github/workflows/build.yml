@@ -138,18 +138,23 @@ jobs:
       - name: Cargo test
         run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked
 
-      # Full release-path build. On Linux we bundle deb + rpm but skip AppImage:
+      # Full release-path build. Produce the installer formats we directly share
+      # from GitHub Actions/Releases. On Linux we bundle deb + rpm but skip AppImage:
       # its bundler (linuxdeploy, itself an AppImage) is unreliable on GitHub's
-      # runners due to the FUSE/sandbox restrictions, and deb + rpm already
-      # prove the compile-and-bundle pipeline. macOS/Windows bundle all targets.
+      # runners due to the FUSE/sandbox restrictions.
       - name: Tauri build (Linux, deb + rpm)
         if: matrix.os == 'ubuntu-latest'
         run: npm run tauri build -- --bundles deb,rpm
         working-directory: desktop
 
-      - name: Tauri build (macOS/Windows)
-        if: matrix.os != 'ubuntu-latest'
-        run: npm run tauri build
+      - name: Tauri build (macOS, dmg)
+        if: matrix.os == 'macos-latest'
+        run: npm run tauri build -- --bundles dmg
+        working-directory: desktop
+
+      - name: Tauri build (Windows, nsis + msi)
+        if: matrix.os == 'windows-latest'
+        run: npm run tauri build -- --bundles nsis,msi
         working-directory: desktop
 
       # Preserve the built installers so QA and users have a downloadable
