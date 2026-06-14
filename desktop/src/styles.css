@@ -673,6 +673,7 @@ button.linkish:hover .s-arrow { color: var(--accent); }
 
 .model-note { font-size: 12px; color: var(--faint); display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .model-note.warn { color: var(--yellow); }
+.model-note.ok { color: var(--green); }
 .linklike { background: none; border: none; padding: 0; font: inherit; font-size: 12px; color: var(--accent); cursor: pointer; text-decoration: underline; }
 .linklike:hover { color: var(--accent-strong); }
 .keys-hint { margin-top: 14px; }
@@ -728,3 +729,43 @@ button.linkish:hover .s-arrow { color: var(--accent); }
   .repo-pill { max-width: 50%; }
   .page { padding: 24px 18px 60px; }
 }
+
+
+/* ===========================================================================
+   Repo picker, publish controls, env checks (Start screen additions)
+   =========================================================================== */
+.hint.ok { color: var(--green); }
+.hint.warn { color: var(--yellow); }
+
+.repo-row { display: flex; gap: 8px; align-items: stretch; }
+.repo-row input { flex: 1 1 auto; }
+.repo-row button { white-space: nowrap; }
+
+/* Revealed sub-panels (push options, PR options). */
+.subpanel {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.subpanel[hidden] { display: none; }
+
+/* Tool detection chips (installed / missing). */
+.env-checks { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.env-checks .tool {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: var(--r-pill, 999px);
+  border: 1px solid var(--border);
+}
+.env-checks .tool.ok { color: var(--green); border-color: var(--green); background: var(--green-soft); }
+.env-checks .tool.missing { color: var(--muted); border-color: var(--border); }
+
+/* Session row: results link + optional Resume button side by side. */
+.session-row { display: flex; align-items: stretch; gap: 8px; }
+.session-row .linkish { flex: 1 1 auto; }
+.session-row .ghost.small { align-self: center; white-space: nowrap; }

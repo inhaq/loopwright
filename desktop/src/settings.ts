@@ -2,14 +2,19 @@
  * Run settings + the model catalog.
  *
  * The engine itself is vendor-neutral: a run is configured purely by env vars
- * (LOOPWRIGHT_RUNNERS + role bindings). This module is the UI-side source of
- * truth that turns a friendly "which model writes / which model reviews"
- * choice into those env vars, and remembers the user's choice between runs.
+ * (LOOPWRIGHT_RUNNERS + role bindings + publishing flags) plus an optional
+ * repo path. This module is the UI-side source of truth that turns a friendly
+ * "which model writes / which model reviews" choice into those env vars, and
+ * remembers every run-shaping preference between runs so the New run screen can
+ * stay a minimal goal box while nothing is lost.
  *
- * Models are grouped by the *environment key* (API key env var) that unlocks
- * them, so the Secrets view can show exactly what each key enables and the
- * Model-settings view can offer only models the user can actually run.
+ * HTTP models are grouped by the *environment key* (API key env var) that
+ * unlocks them; CLI agents (Codex, Kiro) are grouped by the local command that
+ * must be installed. CLI actors are the ones that actually edit files on disk —
+ * HTTP runners only return a diff the engine does not apply.
  */
+
+export type ProviderKind = "http" | "cli";
 
 export interface CatalogModel {
   /** model id sent to the provider (the runner profile's `model`) */
@@ -19,27 +24,34 @@ export interface CatalogModel {
 }
 
 export interface Provider {
-  /** stable provider id, e.g. "openai" */
+  /** stable provider id, e.g. "openai" or "codex" */
   id: string;
   /** display name, e.g. "OpenAI" */
   label: string;
-  /** OpenAI-compatible base URL the HttpRunner targets */
-  baseUrl: string;
-  /** env var name that holds this provider's API key */
-  apiKeyEnv: string;
-  /** models this key unlocks */
+  kind: ProviderKind;
+  /** http: OpenAI-compatible base URL the HttpRunner targets */
+  baseUrl?: string;
+  /** http: env var name that holds this provider's API key */
+  apiKeyEnv?: string;
+  /** cli: the command that must be on PATH (used for install detection) */
+  command?: string;
+  /** true for CLI actors that edit files directly (can produce real changes) */
+  editsFiles?: boolean;
+  /** models this provider offers */
   models: CatalogModel[];
 }
 
 /**
- * Real providers and models, keyed by the environment variable that holds the
- * API key. No placeholder/demo entries: every model here is something a user
- * can actually run once the matching key is stored.
+ * Real providers and models. HTTP providers are keyed by the environment
+ * variable that holds the API key; CLI providers are local file-editing agents.
+ * No placeholder/demo entries: every option here is something a user can
+ * actually run once the matching key is stored or the command is installed.
  */
 export const MODEL_CATALOG: Provider[] = [
   {
     id: "openai",
     label: "OpenAI",
+    kind: "http",
     baseUrl: "https://api.openai.com/v1",
     apiKeyEnv: "OPENAI_API_KEY",
     models: [
@@ -54,6 +66,7 @@ export const MODEL_CATALOG: Provider[] = [
   {
     id: "anthropic",
     label: "Anthropic",
+    kind: "http",
     baseUrl: "https://api.anthropic.com/v1",
     apiKeyEnv: "ANTHROPIC_API_KEY",
     models: [
@@ -65,6 +78,7 @@ export const MODEL_CATALOG: Provider[] = [
   {
     id: "google",
     label: "Google",
+    kind: "http",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
     apiKeyEnv: "GEMINI_API_KEY",
     models: [
@@ -72,6 +86,22 @@ export const MODEL_CATALOG: Provider[] = [
       { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
       { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
     ],
+  },
+  {
+    id: "codex",
+    label: "Codex CLI",
+    kind: "cli",
+    command: "codex",
+    editsFiles: true,
+    models: [{ id: "codex", label: "Codex (edits files)" }],
+  },
+  {
+    id: "kiro",
+    label: "Kiro CLI",
+    kind: "cli",
+    command: "kiro",
+    editsFiles: true,
+    models: [{ id: "kiro", label: "Kiro (edits files)" }],
   },
 ];
 
@@ -82,18 +112,49 @@ export interface ModelChoice {
 }
 
 export interface RunSettings {
-  /** label of the repository the run targets (shown on the New run box) */
+  /** absolute path of the local git repo the run builds against ("" = engine cwd) */
   repo: string;
   /** model that writes the code (actor role) */
   writer: ModelChoice;
   /** model that reviews the code (critic role) */
   reviewer: ModelChoice;
+
   /** how many tasks run at once */
   maxParallel: number;
   /** isolate each task in its own git worktree */
   worktrees: boolean;
   /** run build/test/lint before the critic reviews */
   mechanicalGate: boolean;
+
+  /** prefix for generated branch names */
+  branchPrefix: string;
+  /** build a local integration branch but never push */
+  dryRun: boolean;
+  /** push the integration branch after a clean, verified run */
+  pushToRemote: boolean;
+  /** git remote to push to */
+  remote: string;
+  /** target branch to push to ("" = generated integration branch) */
+  pushBranch: string;
+  /** open a pull request after pushing (needs gh) */
+  openPr: boolean;
+  /** PR base branch ("" = repo default) */
+  prBase: string;
+  /** PR title ("" = generated from goal) */
+  prTitle: string;
+  /** open the PR as a draft */
+  prDraft: boolean;
+  /** push even if integration/verification failed (unsafe) */
+  pushOverride: boolean;
+
+  /**
+   * Power-user escape hatch: raw runner-profile JSON. When non-empty it
+   * overrides the catalog-derived writer/reviewer runners, and the role ids
+   * below pick which profile backs each role.
+   */
+  advancedRunners: string;
+  advancedActor: string;
+  advancedCritic: string;
 }
 
 const STORAGE_KEY = "loopwright.runSettings.v1";
@@ -108,6 +169,19 @@ export const DEFAULT_SETTINGS: RunSettings = {
   maxParallel: 2,
   worktrees: true,
   mechanicalGate: true,
+  branchPrefix: "loopwright",
+  dryRun: false,
+  pushToRemote: false,
+  remote: "origin",
+  pushBranch: "",
+  openPr: false,
+  prBase: "",
+  prTitle: "",
+  prDraft: true,
+  pushOverride: false,
+  advancedRunners: "",
+  advancedActor: "",
+  advancedCritic: "",
 };
 
 export function getProvider(id: string): Provider | undefined {
@@ -122,16 +196,19 @@ export function findModel(choice: ModelChoice): { provider: Provider; model: Cat
   return { provider, model };
 }
 
-/** Friendly one-line label for a model choice, e.g. "GPT-4o mini · OpenAI". */
-export function describeChoice(choice: ModelChoice): string {
-  const found = findModel(choice);
-  if (!found) return choice.model || "Not selected";
-  return `${found.model.label} · ${found.provider.label}`;
+/** True when the choice resolves to a CLI agent that edits files on disk. */
+export function editsFiles(choice: ModelChoice): boolean {
+  return getProvider(choice.provider)?.editsFiles === true;
 }
 
 /** Just the model label, e.g. "GPT-4o mini" (falls back to the raw id). */
 export function modelLabel(choice: ModelChoice): string {
   return findModel(choice)?.model.label ?? choice.model ?? "—";
+}
+
+/** True when an advanced runner-profile override is active. */
+export function usesAdvancedRunners(settings: RunSettings): boolean {
+  return settings.advancedRunners.trim() !== "";
 }
 
 /** Loads saved settings, falling back to defaults and tolerating bad/legacy data. */
@@ -167,13 +244,35 @@ export function saveSettings(settings: RunSettings): void {
 /** A runner profile as accepted by LOOPWRIGHT_RUNNERS. */
 interface RunnerProfile {
   id: string;
-  kind: "http";
+  kind: ProviderKind;
   model: string;
-  options: { baseUrl: string; apiKeyEnv: string };
+  options: Record<string, unknown>;
 }
 
 function profileFor(id: string, choice: ModelChoice): RunnerProfile {
   const provider = getProvider(choice.provider) ?? firstProvider;
+  if (provider.kind === "cli") {
+    if (provider.id === "kiro") {
+      return {
+        id,
+        kind: "cli",
+        model: "",
+        options: { command: "kiro", args: ["--headless", "--prompt", "{{prompt}}"], promptVia: "arg", output: { mode: "last-line" } },
+      };
+    }
+    // Codex (default CLI shape)
+    return {
+      id,
+      kind: "cli",
+      model: "",
+      options: {
+        command: "codex",
+        args: ["exec", "--json", "{{prompt}}"],
+        promptVia: "arg",
+        output: { mode: "json-stream", textPath: "msg.text", typeField: "type", type: "item.completed" },
+      },
+    };
+  }
   return {
     id,
     kind: "http",
@@ -184,19 +283,41 @@ function profileFor(id: string, choice: ModelChoice): RunnerProfile {
 
 /**
  * Translates the saved settings into the LOOPWRIGHT_* env the engine expects.
- * The writer backs the actor role, the reviewer backs the critic role.
+ * The writer backs the actor role, the reviewer backs the critic role. An
+ * advanced runner-profile override, when present, wins over the catalog.
+ *
+ * Note: LOOPWRIGHT_RUNNERS is returned verbatim from `advancedRunners` when set;
+ * callers should validate it is JSON before starting a run.
  */
 export function buildRunEnv(settings: RunSettings): Record<string, string> {
-  const runners: RunnerProfile[] = [
-    profileFor("writer", settings.writer),
-    profileFor("reviewer", settings.reviewer),
-  ];
+  let runnersJson: string;
+  let actor: string;
+  let critic: string;
+  if (usesAdvancedRunners(settings)) {
+    runnersJson = settings.advancedRunners.trim();
+    actor = settings.advancedActor.trim();
+    critic = settings.advancedCritic.trim();
+  } else {
+    runnersJson = JSON.stringify([profileFor("writer", settings.writer), profileFor("reviewer", settings.reviewer)]);
+    actor = "writer";
+    critic = "reviewer";
+  }
   return {
-    LOOPWRIGHT_RUNNERS: JSON.stringify(runners),
-    LOOPWRIGHT_ACTOR_RUNNER: "writer",
-    LOOPWRIGHT_CRITIC_RUNNER: "reviewer",
+    LOOPWRIGHT_RUNNERS: runnersJson,
+    LOOPWRIGHT_ACTOR_RUNNER: actor,
+    LOOPWRIGHT_CRITIC_RUNNER: critic,
     LOOPWRIGHT_MAX_PARALLEL: String(settings.maxParallel),
     LOOPWRIGHT_USE_WORKTREES: settings.worktrees ? "true" : "false",
     LOOPWRIGHT_MECHANICAL_GATE: settings.mechanicalGate ? "true" : "false",
+    LOOPWRIGHT_BRANCH_PREFIX: settings.branchPrefix.trim() || "loopwright",
+    LOOPWRIGHT_DRY_RUN: settings.dryRun ? "true" : "false",
+    LOOPWRIGHT_PUSH_TO_REMOTE: settings.pushToRemote ? "true" : "false",
+    LOOPWRIGHT_REMOTE: settings.remote.trim() || "origin",
+    LOOPWRIGHT_PUSH_BRANCH: settings.pushBranch.trim(),
+    LOOPWRIGHT_OPEN_PR: settings.openPr ? "true" : "false",
+    LOOPWRIGHT_PR_BASE: settings.prBase.trim(),
+    LOOPWRIGHT_PR_TITLE: settings.prTitle.trim(),
+    LOOPWRIGHT_PR_DRAFT: settings.prDraft ? "true" : "false",
+    LOOPWRIGHT_PUSH_OVERRIDE_SAFETY: settings.pushOverride ? "true" : "false",
   };
 }

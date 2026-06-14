@@ -6,6 +6,7 @@
 //! the OS-keychain secret storage the engine consumes via its environment.
 
 mod engine;
+mod repo;
 mod secrets;
 
 use engine::EngineManager;
@@ -50,6 +51,7 @@ fn list_secret_keys(app: tauri::AppHandle) -> Result<Vec<String>, String> {
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Start the engine sidecar up front so the UI has an endpoint as
             // soon as it loads. A startup failure aborts the app with a clear
@@ -67,7 +69,10 @@ pub fn run() {
             restart_engine,
             set_secret,
             delete_secret,
-            list_secret_keys
+            list_secret_keys,
+            repo::pick_directory,
+            repo::check_git_repo,
+            repo::which_commands
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

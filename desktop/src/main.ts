@@ -3,13 +3,16 @@ import {
   apiBase,
   activeRunCount,
   cancelRun,
+  checkGitRepo,
   deleteSecret,
+  detectCommands,
   getTrace,
   health,
   isTauri,
   listSecretKeys,
   listSessions,
   openStream,
+  pickDirectory,
   restartEngine,
   setSecret,
   startRun,
@@ -17,10 +20,12 @@ import {
 import {
   MODEL_CATALOG,
   buildRunEnv,
+  editsFiles,
   findModel,
   loadSettings,
   modelLabel,
   saveSettings,
+  usesAdvancedRunners,
   type ModelChoice,
 } from "./settings.js";
 import type { RunMessage, SessionRecord, TraceResponse } from "./types.js";
@@ -66,11 +71,72 @@ const ICONS = {
   key: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   arrow: '<path d="M9 18l6-6-6-6"/>',
   caret: '<path d="M9 18l6-6-6-6"/>',
-  repo: '<path d="M3 3h12a2 2 0 0 1 2 2v16l-8-4-8 4V5a2 2 0 0 1 2-2z" transform="translate(2 0)"/>',
+  folder: '<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2z"/>',
+  github: '<path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/>',
   write: '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
   review: '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
   sliders: '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
 };
+
+// --- recent repos (persisted locally) --------------------------------------
+
+const RECENT_REPOS_KEY = "loopwright.recentRepos";
+const MAX_RECENT_REPOS = 8;
+
+/** Returns the recently used repo folders, most-recent first. */
+function recentRepos(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_REPOS_KEY);
+    const arr = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Records `dir` as the most-recently used repo folder (de-duplicated). */
+function rememberRepo(dir: string): void {
+  if (!dir) return;
+  try {
+    const next = [dir, ...recentRepos().filter((d) => d !== dir)].slice(0, MAX_RECENT_REPOS);
+    localStorage.setItem(RECENT_REPOS_KEY, JSON.stringify(next));
+  } catch {
+    /* localStorage unavailable — recents are best-effort */
+  }
+}
+
+// --- saved run configs (for "resume in same repo") -------------------------
+
+const RUN_CONFIGS_KEY = "loopwright.runConfigs";
+
+interface SavedRun {
+  goal: string;
+  repoDir?: string;
+  env: Record<string, string>;
+}
+
+/** Persists the start payload for a session so it can be resumed in the same repo. */
+function saveRunConfig(sessionId: string, cfg: SavedRun): void {
+  try {
+    const raw = localStorage.getItem(RUN_CONFIGS_KEY);
+    const all = (raw ? JSON.parse(raw) : {}) as Record<string, SavedRun>;
+    all[sessionId] = cfg;
+    localStorage.setItem(RUN_CONFIGS_KEY, JSON.stringify(all));
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Loads a previously saved start payload for a session, if any. */
+function loadRunConfig(sessionId: string): SavedRun | undefined {
+  try {
+    const raw = localStorage.getItem(RUN_CONFIGS_KEY);
+    const all = (raw ? JSON.parse(raw) : {}) as Record<string, SavedRun>;
+    return all[sessionId];
+  } catch {
+    return undefined;
+  }
+}
 
 /** Valid POSIX-ish environment variable name (used for secret keys). */
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -114,6 +180,12 @@ const EXAMPLE_GOALS = [
   "Refactor the config loader to use zod",
 ];
 
+/** Last path segment of a repo dir, for compact display in the run box. */
+function repoName(p: string): string {
+  const parts = p.replace(/[/\\]+$/, "").split(/[/\\]/);
+  return parts[parts.length - 1] || p;
+}
+
 function renderStart(): void {
   const settings = loadSettings();
   const page = h("section", { class: "page page-run" });
@@ -127,13 +199,39 @@ function renderStart(): void {
 
   const form = h("form", { class: "card run-box" });
 
-  // -- Top row: "Goal" label on the left, selected repo on the right.
-  const repoPill = h("button", { type: "button", class: "repo-pill", title: "Change in Model settings" }, [
-    icon(ICONS.repo),
-    h("span", {}, [settings.repo.trim() || "No repository selected"]),
-  ]);
-  repoPill.classList.toggle("unset", !settings.repo.trim());
-  repoPill.addEventListener("click", () => navigate("models"));
+  // -- Top row: "Goal" label (left) + the selected repository (top-right).
+  const repoText = h("span", {});
+  const repoPill = h("button", { type: "button", class: "repo-pill" }, [icon(ICONS.folder), repoText]);
+  const repoStatus = h("span", { class: "hint", id: "repo-status" });
+  function paintRepo(): void {
+    const r = settings.repo.trim();
+    repoText.textContent = r ? repoName(r) : "No repository selected";
+    repoPill.title = r || "Choose a repository";
+    repoPill.classList.toggle("unset", !r);
+  }
+  paintRepo();
+  repoPill.addEventListener("click", async () => {
+    // Desktop: pick + validate a folder right here. Browser: send the user to
+    // Model settings, where a path can be typed (no native picker in a browser).
+    if (!isTauri()) {
+      navigate("models");
+      return;
+    }
+    const dir = await pickDirectory();
+    if (!dir) return;
+    const ok = await checkGitRepo(dir);
+    if (ok === false) {
+      repoStatus.textContent = "Not a git repository — pick a folder containing a .git directory.";
+      repoStatus.className = "hint error";
+      return;
+    }
+    settings.repo = dir;
+    saveSettings(settings);
+    rememberRepo(dir);
+    repoStatus.textContent = "";
+    repoStatus.className = "hint";
+    paintRepo();
+  });
 
   const topRow = h("div", { class: "run-box-top" }, [
     h("label", { class: "label", for: "start-goal" }, ["Goal"]),
@@ -148,7 +246,6 @@ function renderStart(): void {
     placeholder: "e.g. Add a /healthz endpoint that returns 200 and write a test for it",
     required: "true",
   }) as HTMLTextAreaElement;
-
   const chips = h("div", { class: "chips" });
   for (const ex of EXAMPLE_GOALS) {
     const chip = h("button", { type: "button", class: "chip" }, [ex]);
@@ -159,20 +256,23 @@ function renderStart(): void {
     chips.append(chip);
   }
 
-  // -- Bottom row: run button on the left, the two models in use on the right.
+  // -- Bottom row: Start button (left) + the two models in use (bottom-right).
   const submit = h("button", { type: "submit", class: "primary" }, [icon(ICONS.rocket), "Start run"]);
-
-  const models = h("button", { type: "button", class: "run-models", title: "Change in Model settings" }, [
-    h("span", { class: "run-model" }, [icon(ICONS.write, "rm-ico"), h("span", { class: "rm-role" }, ["Writes"]), h("span", { class: "rm-name" }, [modelLabel(settings.writer)])]),
-    h("span", { class: "run-model" }, [icon(ICONS.review, "rm-ico"), h("span", { class: "rm-role" }, ["Reviews"]), h("span", { class: "rm-name" }, [modelLabel(settings.reviewer)])]),
-  ]);
-  models.addEventListener("click", () => navigate("models"));
-
-  const bottomRow = h("div", { class: "run-box-bottom" }, [submit, models]);
+  const modelsBtn = h("button", { type: "button", class: "run-models", title: "Change in Model settings" });
+  if (usesAdvancedRunners(settings)) {
+    modelsBtn.append(h("span", { class: "run-model" }, [icon(ICONS.sliders, "rm-ico"), h("span", { class: "rm-name" }, ["Custom runners"])]));
+  } else {
+    modelsBtn.append(
+      h("span", { class: "run-model" }, [icon(ICONS.write, "rm-ico"), h("span", { class: "rm-role" }, ["Writes"]), h("span", { class: "rm-name" }, [modelLabel(settings.writer)])]),
+      h("span", { class: "run-model" }, [icon(ICONS.review, "rm-ico"), h("span", { class: "rm-role" }, ["Reviews"]), h("span", { class: "rm-name" }, [modelLabel(settings.reviewer)])]),
+    );
+  }
+  modelsBtn.addEventListener("click", () => navigate("models"));
+  const bottomRow = h("div", { class: "run-box-bottom" }, [submit, modelsBtn]);
 
   const hint = h("span", { class: "hint", id: "start-hint" });
 
-  form.append(topRow, goalArea, chips, bottomRow, hint);
+  form.append(topRow, goalArea, chips, repoStatus, bottomRow, hint);
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -182,11 +282,41 @@ function renderStart(): void {
       return;
     }
 
+    const repoDir = settings.repo.trim();
+
+    // Guard: pushing requires a repo. Fail early with a clear, inline message.
+    if (settings.pushToRemote && !repoDir) {
+      hint.textContent = "Select a repository before enabling “Push to GitHub” (Model settings).";
+      hint.className = "hint error";
+      return;
+    }
+    // Desktop: re-verify the path is a git tree before hitting the engine.
+    if (repoDir && isTauri()) {
+      const ok = await checkGitRepo(repoDir);
+      if (ok === false) {
+        hint.textContent = "The selected repository is not a git repository (Model settings).";
+        hint.className = "hint error";
+        return;
+      }
+    }
+
+    const env = buildRunEnv(settings);
+    try {
+      // Validate JSON early so the user gets a clear message, not a 400.
+      if (env.LOOPWRIGHT_RUNNERS) JSON.parse(env.LOOPWRIGHT_RUNNERS);
+    } catch (err) {
+      hint.textContent = `Runner profiles must be valid JSON (Model settings → Advanced): ${(err as Error).message}`;
+      hint.className = "hint error";
+      return;
+    }
+
     hint.textContent = "Starting…";
     hint.className = "hint";
     submit.setAttribute("disabled", "true");
     try {
-      const sessionId = await startRun({ goal, env: buildRunEnv(settings) });
+      const sessionId = await startRun({ goal, env, ...(repoDir ? { repoDir } : {}) });
+      if (repoDir) rememberRepo(repoDir);
+      saveRunConfig(sessionId, { goal, env, ...(repoDir ? { repoDir } : {}) });
       renderMonitor(sessionId, goal);
     } catch (err) {
       submit.removeAttribute("disabled");
@@ -203,114 +333,157 @@ function renderStart(): void {
 
 async function renderModels(): Promise<void> {
   const settings = loadSettings();
+  const persist = (): void => saveSettings(settings);
+
   const page = h("section", { class: "page" });
   page.append(
     h("div", { class: "page-head" }, [
       h("h1", {}, ["Model settings"]),
       h("p", { class: "page-sub" }, [
-        "Choose which model writes the code and which reviews it, pick the repository to work in, and tune how runs execute. These apply to every new run.",
+        "Choose which model writes the code and which reviews it, pick the repository to work in, and control run + publishing options. These apply to every new run.",
       ]),
     ]),
   );
   view.append(page);
 
-  // Which provider keys are stored locally (Tauri keychain). In the browser we
-  // can't see them — keys live in the engine's environment — so we don't gate.
+  // Availability: HTTP providers are unlocked by a stored API key (Tauri
+  // keychain); CLI agents by an installed command. In a browser we can't see
+  // either, so nothing is gated there.
   let storedKeys = new Set<string>();
   let knowKeys = false;
+  let installed: Record<string, boolean> = {};
   if (isTauri()) {
     try {
       storedKeys = new Set(await listSecretKeys());
       knowKeys = true;
     } catch {
-      /* fall back to "unknown" — show everything as selectable */
+      /* unknown — show everything as selectable */
+    }
+    try {
+      installed = await detectCommands(["codex", "kiro", "gh"]);
+    } catch {
+      /* unknown — don't flag CLI agents as missing */
     }
   }
 
-  const persist = (): void => saveSettings(settings);
+  function providerMissing(p: (typeof MODEL_CATALOG)[number]): boolean {
+    if (p.kind === "cli") return isTauri() && installed[p.command ?? ""] !== true;
+    return knowKeys && !storedKeys.has(p.apiKeyEnv ?? "");
+  }
+  function providerMissingLabel(p: (typeof MODEL_CATALOG)[number]): string {
+    return p.kind === "cli" ? `install ${p.command}` : `add ${p.apiKeyEnv}`;
+  }
 
-  /**
-   * Builds a grouped <select> of every catalog model. Models whose API key
-   * isn't stored are still listed but flagged, so the choice is informed.
-   */
   function modelSelect(role: "writer" | "reviewer", onChange: () => void): HTMLSelectElement {
     const current = settings[role];
     const select = h("select", { "aria-label": `${role} model` }) as HTMLSelectElement;
     for (const provider of MODEL_CATALOG) {
-      const missing = knowKeys && !storedKeys.has(provider.apiKeyEnv);
-      const group = h("optgroup", { label: missing ? `${provider.label} (add ${provider.apiKeyEnv})` : provider.label }) as HTMLOptGroupElement;
+      const missing = providerMissing(provider);
+      const group = h("optgroup", { label: missing ? `${provider.label} (${providerMissingLabel(provider)})` : provider.label }) as HTMLOptGroupElement;
       for (const m of provider.models) {
-        const value = `${provider.id}::${m.id}`;
-        const opt = h("option", { value }, [m.label]) as HTMLOptionElement;
+        const opt = h("option", { value: `${provider.id}::${m.id}` }, [m.label]) as HTMLOptionElement;
         if (current.provider === provider.id && current.model === m.id) opt.selected = true;
         group.append(opt);
       }
       select.append(group);
     }
     select.addEventListener("change", () => {
-      const [provider, model] = select.value.split("::");
-      settings[role] = { provider: provider!, model: model! } as ModelChoice;
+      const [p, m] = select.value.split("::");
+      settings[role] = { provider: p!, model: m! } as ModelChoice;
       persist();
       onChange();
     });
     return select;
   }
 
-  // -- Repository
-  const repoInput = h("input", {
-    type: "text",
-    value: settings.repo,
-    placeholder: "e.g. acme/web-app",
-    "aria-label": "Repository",
-  }) as HTMLInputElement;
-  repoInput.addEventListener("input", () => {
-    settings.repo = repoInput.value;
-    persist();
-  });
-  const repoCard = h("div", { class: "card" }, [
-    h("h3", {}, ["Repository"]),
-    h("div", { class: "field" }, [
-      h("div", { class: "desc" }, ["The repository this run works in. Shown on the New run box so you always know where the agents are operating."]),
-      repoInput,
-    ]),
-  ]);
-
-  // -- Models (writer + reviewer)
-  const writerNote = h("div", { class: "model-note" });
-  const reviewerNote = h("div", { class: "model-note" });
-
-  function keyHint(choice: ModelChoice): HTMLElement {
-    const found = findModel(choice);
+  function noteFor(role: "writer" | "reviewer", choice: ModelChoice): HTMLElement {
     const note = h("div", { class: "model-note" });
+    const found = findModel(choice);
     if (!found) return note;
-    if (knowKeys && !storedKeys.has(found.provider.apiKeyEnv)) {
-      note.classList.add("warn");
-      const link = h("button", { type: "button", class: "linklike" }, [`Add ${found.provider.apiKeyEnv}`]);
+    const { provider } = found;
+    if (provider.kind === "http" && knowKeys && !storedKeys.has(provider.apiKeyEnv ?? "")) {
+      note.className = "model-note warn";
+      const link = h("button", { type: "button", class: "linklike" }, [`Add ${provider.apiKeyEnv}`]);
       link.addEventListener("click", () => navigate("secrets"));
-      note.append(h("span", {}, [`No key stored for ${found.provider.label}. `]), link);
-    } else {
-      note.append(h("span", {}, [`Uses ${found.provider.apiKeyEnv} · ${found.model.id}`]));
+      note.append(h("span", {}, [`No key stored for ${provider.label}. `]), link);
+      return note;
     }
+    if (provider.kind === "cli" && isTauri() && installed[provider.command ?? ""] !== true) {
+      note.className = "model-note warn";
+      note.append(h("span", {}, [`${provider.command} is not installed — install it to use ${provider.label}.`]));
+      return note;
+    }
+    if (role === "writer") {
+      if (editsFiles(choice)) {
+        note.className = "model-note ok";
+        note.append(h("span", {}, ["Edits files directly — runs can produce real, committable changes."]));
+      } else {
+        note.className = "model-note warn";
+        note.append(h("span", {}, ["HTTP models return a diff but don't edit files. Pick a CLI writer (Codex / Kiro) to change a repo."]));
+      }
+      return note;
+    }
+    note.append(h("span", {}, [provider.kind === "http" ? `Uses ${provider.apiKeyEnv}` : `Local command: ${provider.command}`]));
     return note;
   }
 
-  const writerSelect = modelSelect("writer", () => {
-    refreshNote(writerNote, settings.writer);
-  });
-  const reviewerSelect = modelSelect("reviewer", () => {
-    refreshNote(reviewerNote, settings.reviewer);
-  });
-
-  function refreshNote(target: HTMLElement, choice: ModelChoice): void {
-    const fresh = keyHint(choice);
+  const writerNote = h("div", { class: "model-note" });
+  const reviewerNote = h("div", { class: "model-note" });
+  function setNote(target: HTMLElement, role: "writer" | "reviewer"): void {
+    const fresh = noteFor(role, settings[role]);
     target.className = fresh.className;
-    target.innerHTML = fresh.innerHTML;
-    // Re-bind the "Add key" button if present (innerHTML drops listeners).
-    const btn = target.querySelector("button.linklike");
-    if (btn) btn.addEventListener("click", () => navigate("secrets"));
+    target.replaceChildren(...Array.from(fresh.childNodes));
   }
-  refreshNote(writerNote, settings.writer);
-  refreshNote(reviewerNote, settings.reviewer);
+  const writerSelect = modelSelect("writer", () => setNote(writerNote, "writer"));
+  const reviewerSelect = modelSelect("reviewer", () => setNote(reviewerNote, "reviewer"));
+  setNote(writerNote, "writer");
+  setNote(reviewerNote, "reviewer");
+
+  // -- Advanced: raw runner-profile override (escape hatch for power users)
+  const advRunners = h("textarea", { rows: "8", spellcheck: "false", class: "mono", "aria-label": "Runner profiles (JSON)" }) as HTMLTextAreaElement;
+  advRunners.value = settings.advancedRunners;
+  const advActor = h("input", { type: "text", placeholder: "actor runner id" }) as HTMLInputElement;
+  advActor.value = settings.advancedActor;
+  const advCritic = h("input", { type: "text", placeholder: "critic runner id" }) as HTMLInputElement;
+  advCritic.value = settings.advancedCritic;
+  const advHint = h("div", { class: "hint" });
+  function commitAdvanced(): void {
+    settings.advancedRunners = advRunners.value;
+    settings.advancedActor = advActor.value.trim();
+    settings.advancedCritic = advCritic.value.trim();
+    persist();
+    if (settings.advancedRunners.trim()) {
+      try {
+        JSON.parse(settings.advancedRunners);
+        advHint.textContent = "Active — overrides the Writer / Reviewer pickers above.";
+        advHint.className = "hint ok";
+      } catch (err) {
+        advHint.textContent = `Invalid JSON: ${(err as Error).message}`;
+        advHint.className = "hint error";
+      }
+    } else {
+      advHint.textContent = "Leave empty to use the model pickers above.";
+      advHint.className = "hint";
+    }
+  }
+  advRunners.addEventListener("input", commitAdvanced);
+  advActor.addEventListener("input", commitAdvanced);
+  advCritic.addEventListener("input", commitAdvanced);
+  commitAdvanced();
+  const advancedDetails = h("details", { class: "advanced" });
+  if (usesAdvancedRunners(settings)) advancedDetails.setAttribute("open", "true");
+  advancedDetails.append(
+    h("summary", {}, [icon(ICONS.caret, "caret"), "Advanced — custom runner profiles (JSON)"]),
+    h("div", { class: "advanced-body" }, [
+      advRunners,
+      h("div", { class: "field-grid" }, [
+        h("label", { class: "inline-label" }, ["Actor runner id", advActor]),
+        h("label", { class: "inline-label" }, ["Critic runner id", advCritic]),
+      ]),
+      h("small", { class: "desc" }, ["Maps to LOOPWRIGHT_RUNNERS. When set, this overrides the pickers. API keys are referenced by env var name (apiKeyEnv) and resolved from secure storage — never pasted here."]),
+      advHint,
+    ]),
+  );
 
   const modelsCard = h("div", { class: "card" }, [
     h("h3", {}, ["Models"]),
@@ -328,14 +501,90 @@ async function renderModels(): Promise<void> {
     ]),
     h("div", { class: "desc keys-hint" }, [
       isTauri()
-        ? "Models are unlocked by the API keys you store under Secrets."
-        : "Models are unlocked by the API keys provided in the engine's environment.",
+        ? "HTTP models are unlocked by the API keys you store under Secrets; CLI agents must be installed locally."
+        : "HTTP models are unlocked by the API keys provided in the engine's environment.",
     ]),
+    advancedDetails,
   ]);
 
+  // -- Repository
+  const repoInput = h("input", {
+    type: "text",
+    value: settings.repo,
+    placeholder: isTauri() ? "Select a local git repository…" : "/absolute/path/to/your/repo",
+    autocomplete: "off",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+  const browseBtn = h("button", { type: "button", class: "ghost" }, [icon(ICONS.folder), "Browse…"]);
+  if (!isTauri()) browseBtn.setAttribute("disabled", "true");
+  const repoStatus = h("span", { class: "hint" });
+  async function validateRepo(): Promise<void> {
+    const dir = repoInput.value.trim();
+    settings.repo = dir;
+    persist();
+    if (!dir) {
+      repoStatus.textContent = "Optional — leave empty to build in the engine's working directory (no worktrees).";
+      repoStatus.className = "hint";
+      return;
+    }
+    const ok = await checkGitRepo(dir);
+    if (ok === null) {
+      repoStatus.textContent = "Will be validated as a git repository when the run starts.";
+      repoStatus.className = "hint";
+      return;
+    }
+    repoStatus.textContent = ok ? "✓ Git repository detected." : "Not a git repository — pick a folder that contains a .git directory.";
+    repoStatus.className = ok ? "hint ok" : "hint error";
+  }
+  repoInput.addEventListener("change", () => void validateRepo());
+  repoInput.addEventListener("blur", () => void validateRepo());
+  browseBtn.addEventListener("click", async () => {
+    const dir = await pickDirectory();
+    if (dir) {
+      repoInput.value = dir;
+      rememberRepo(dir);
+      await validateRepo();
+    }
+  });
+
+  const recents = recentRepos();
+  const recentChips = h("div", { class: "chips" });
+  if (recents.length) {
+    recentChips.append(h("span", { class: "desc" }, ["Recent:"]));
+    for (const dir of recents) {
+      const chip = h("button", { type: "button", class: "chip", title: dir }, [repoName(dir)]);
+      chip.addEventListener("click", () => {
+        repoInput.value = dir;
+        void validateRepo();
+      });
+      recentChips.append(chip);
+    }
+  }
+
+  const repoCard = h("div", { class: "card" }, [
+    h("h3", {}, ["Repository"]),
+    h("div", { class: "field" }, [
+      h("div", { class: "desc" }, ["The local git repo the agents edit. Each task builds in an isolated worktree off this repo. Shown on the New run box."]),
+      h("div", { class: "repo-row" }, [repoInput, browseBtn]),
+      repoStatus,
+      recentChips,
+    ]),
+  ]);
+  void validateRepo();
+
   // -- Run options
-  const optionsCard = h("div", { class: "card" }, [h("h3", {}, ["Run options"])]);
-  const options = h("div", { class: "options" });
+  function switchRow(title: string, desc: string, key: "worktrees" | "mechanicalGate" | "dryRun"): HTMLElement {
+    const input = h("input", { type: "checkbox", "aria-label": title }) as HTMLInputElement;
+    if (settings[key]) input.checked = true;
+    input.addEventListener("change", () => {
+      settings[key] = input.checked;
+      persist();
+    });
+    return h("div", { class: "option" }, [
+      h("div", { class: "option-text" }, [h("strong", {}, [title]), h("span", {}, [desc])]),
+      h("label", { class: "switch" }, [input, h("span", { class: "track" })]),
+    ]);
+  }
 
   const parallelInput = h("input", { type: "number", min: "1", value: String(settings.maxParallel), "aria-label": "Max parallel tasks" }) as HTMLInputElement;
   const dec = h("button", { type: "button", "aria-label": "decrease" }, [icon("<path d='M5 12h14'/>")]);
@@ -350,30 +599,93 @@ async function renderModels(): Promise<void> {
   parallelInput.addEventListener("change", commitParallel);
   const stepper = h("div", { class: "stepper" }, [parallelInput, h("div", { class: "steps-btns" }, [inc, dec])]);
 
-  function optionRow(title: string, desc: string, key: "worktrees" | "mechanicalGate"): HTMLElement {
-    const input = h("input", { type: "checkbox", "aria-label": title }) as HTMLInputElement;
-    if (settings[key]) input.checked = true;
-    input.addEventListener("change", () => {
-      settings[key] = input.checked;
-      persist();
-    });
+  const optionsCard = h("div", { class: "card" }, [
+    h("h3", {}, ["Run options"]),
+    h("div", { class: "options" }, [
+      h("div", { class: "option" }, [
+        h("div", { class: "option-text" }, [h("strong", {}, ["Max parallel tasks"]), h("span", {}, ["How many tasks run at the same time."])]),
+        stepper,
+      ]),
+      switchRow("Use git worktrees", "Isolate each task in its own worktree so parallel work never collides.", "worktrees"),
+      switchRow("Mechanical gate", "Run build / test / lint checks before the critic reviews each change.", "mechanicalGate"),
+    ]),
+  ]);
+
+  // -- Branch & publishing
+  function textField(label: string, value: string, placeholder: string, on: (v: string) => void): HTMLElement {
+    const input = h("input", { type: "text", value, placeholder, autocomplete: "off", spellcheck: "false" }) as HTMLInputElement;
+    input.addEventListener("input", () => on(input.value));
+    return h("label", { class: "inline-label" }, [label, input]);
+  }
+  function switchWith(input: HTMLInputElement, title: string, desc: string): HTMLElement {
     return h("div", { class: "option" }, [
       h("div", { class: "option-text" }, [h("strong", {}, [title]), h("span", {}, [desc])]),
       h("label", { class: "switch" }, [input, h("span", { class: "track" })]),
     ]);
   }
 
-  options.append(
-    h("div", { class: "option" }, [
-      h("div", { class: "option-text" }, [h("strong", {}, ["Max parallel tasks"]), h("span", {}, ["How many tasks run at the same time."])]),
-      stepper,
-    ]),
-    optionRow("Use git worktrees", "Isolate each task in its own worktree so parallel work never collides.", "worktrees"),
-    optionRow("Mechanical gate", "Run build / test / lint checks before the critic reviews each change.", "mechanicalGate"),
-  );
-  optionsCard.append(options);
+  const branchPrefixField = textField("Branch prefix", settings.branchPrefix, "loopwright", (v) => { settings.branchPrefix = v; persist(); });
+  const dryRunRow = switchRow("Dry run", "Build a local integration branch but never push, even if pushing is enabled.", "dryRun");
 
-  page.append(repoCard, modelsCard, optionsCard);
+  const pushInput = h("input", { type: "checkbox", "aria-label": "Push to GitHub" }) as HTMLInputElement;
+  if (settings.pushToRemote) pushInput.checked = true;
+  const pushRow = switchWith(pushInput, "Push to GitHub", "After a clean, verified integration, push the integration branch to a remote.");
+
+  const pushPanel = h("div", { class: "subpanel", hidden: "true" });
+  const openPrInput = h("input", { type: "checkbox", "aria-label": "Open a pull request" }) as HTMLInputElement;
+  if (settings.openPr) openPrInput.checked = true;
+  const openPrRow = switchWith(openPrInput, "Open a pull request", "After pushing, open a PR with the GitHub CLI (gh).");
+  const prPanel = h("div", { class: "subpanel", hidden: "true" });
+  const prDraftInput = h("input", { type: "checkbox", "aria-label": "Open as draft" }) as HTMLInputElement;
+  if (settings.prDraft) prDraftInput.checked = true;
+  prDraftInput.addEventListener("change", () => { settings.prDraft = prDraftInput.checked; persist(); });
+  prPanel.append(
+    h("div", { class: "field-grid" }, [
+      textField("PR base branch", settings.prBase, "(repo default branch)", (v) => { settings.prBase = v; persist(); }),
+      textField("PR title", settings.prTitle, "(generated from the goal)", (v) => { settings.prTitle = v; persist(); }),
+    ]),
+    switchWith(prDraftInput, "Open as draft", "Recommended — open the PR as a draft for review."),
+  );
+  prPanel.hidden = !settings.openPr;
+  openPrInput.addEventListener("change", () => { settings.openPr = openPrInput.checked; persist(); prPanel.hidden = !openPrInput.checked; });
+
+  const overrideInput = h("input", { type: "checkbox", "aria-label": "Override safety checks" }) as HTMLInputElement;
+  if (settings.pushOverride) overrideInput.checked = true;
+  overrideInput.addEventListener("change", () => { settings.pushOverride = overrideInput.checked; persist(); });
+
+  pushPanel.append(
+    h("div", { class: "field-grid" }, [
+      textField("Remote", settings.remote, "origin", (v) => { settings.remote = v; persist(); }),
+      textField("Target branch", settings.pushBranch, "(default: generated integration branch)", (v) => { settings.pushBranch = v; persist(); }),
+    ]),
+    openPrRow,
+    prPanel,
+    switchWith(overrideInput, "Override safety checks (unsafe)", "Push even if integration failed, there were merge conflicts, or verification did not pass."),
+  );
+  pushPanel.hidden = !settings.pushToRemote;
+  pushInput.addEventListener("change", () => { settings.pushToRemote = pushInput.checked; persist(); pushPanel.hidden = !pushInput.checked; });
+
+  const envPanel = h("div", { class: "env-checks" });
+  if (isTauri()) {
+    envPanel.append(h("div", { class: "desc" }, ["Detected tools:"]));
+    for (const name of ["codex", "kiro", "gh"]) {
+      const ok = installed[name] === true;
+      envPanel.append(h("span", { class: `tool ${ok ? "ok" : "missing"}` }, [`${name}: ${ok ? "installed" : "missing"}`]));
+    }
+    envPanel.append(h("div", { class: "desc" }, ["Pushing uses your local git credentials. Opening a PR needs gh installed and authenticated (gh auth status), or a GITHUB_TOKEN secret."]));
+  } else {
+    envPanel.append(h("div", { class: "desc" }, ["Pushing uses the engine host's git credentials; opening a PR needs the gh CLI authenticated or a GITHUB_TOKEN in the environment."]));
+  }
+
+  const publishCard = h("div", { class: "card" }, [
+    h("h3", {}, ["Branch & publishing"]),
+    h("div", { class: "desc" }, ["Control branch naming and whether a successful run is pushed to GitHub. Everything here is opt-in and off by default."]),
+    h("div", { class: "options" }, [branchPrefixField, dryRunRow, pushRow]),
+    pushPanel,
+    envPanel,
+  ]);
+
+  page.append(repoCard, modelsCard, optionsCard, publishCard);
 }
 
 // --- Monitor view -----------------------------------------------------------
@@ -621,6 +933,55 @@ async function renderResults(sessionId: string): Promise<void> {
     page.append(card);
   }
 
+  // Publish (push + PR) card — surfaces what reached GitHub, or why it didn't.
+  const publishEvent = trace.events.find((e) => e.type === "publish");
+  if (publishEvent) {
+    const d = publishEvent.data as {
+      pushed?: boolean;
+      remote?: string;
+      branch?: string;
+      pushBranch?: string;
+      remoteUrl?: string;
+      refused?: string;
+      reason?: string;
+      error?: string;
+      pr?: { created?: boolean; url?: string; error?: string };
+    };
+    const pushed = d.pushed === true;
+    const card = h("div", { class: `card${pushed ? "" : " integration-bad"}` });
+    card.append(h("h3", {}, [icon(ICONS.github), " Push & pull request"]));
+
+    if (pushed) {
+      card.append(
+        h("div", { class: "phase done" }, [
+          `Pushed ${String(d.branch ?? "")} → ${String(d.remote ?? "origin")}/${String(d.pushBranch ?? d.branch ?? "")}`,
+        ]),
+      );
+      if (d.remoteUrl) card.append(h("div", { class: "hint" }, [`remote: ${d.remoteUrl}`]));
+      if (d.pr?.created) {
+        const prLine = h("div", { class: "hint ok" }, ["Pull request opened"]);
+        if (d.pr.url) {
+          prLine.append(" — ");
+          prLine.append(h("a", { href: d.pr.url, target: "_blank", rel: "noreferrer" }, [d.pr.url]));
+        }
+        card.append(prLine);
+      } else if (d.pr?.error) {
+        card.append(h("div", { class: "hint error" }, [`PR not opened: ${d.pr.error}`]));
+      }
+    } else if (d.refused) {
+      card.append(
+        h("div", { class: "phase error" }, ["Push refused by safety checks"]),
+        h("pre", { class: "log" }, [d.reason ?? d.refused]),
+      );
+    } else if (d.error) {
+      card.append(
+        h("div", { class: "phase error" }, ["Push failed"]),
+        h("pre", { class: "log" }, [d.error]),
+      );
+    }
+    page.append(card);
+  }
+
   // Usage
   const u = trace.usage;
   const usage = h("div", { class: "card" });
@@ -727,7 +1088,38 @@ async function renderSessions(): Promise<void> {
       icon(ICONS.arrow, "s-arrow"),
     ]);
     btn.addEventListener("click", () => renderResults(s.id));
-    li.append(btn);
+
+    const row = h("div", { class: "session-row" }, [btn]);
+
+    // Resume-in-same-repo (item 14): only when we have the original start
+    // payload (goal, runners, repo) saved locally and the run isn't still going.
+    const saved = loadRunConfig(s.id);
+    if (saved && s.status !== "running") {
+      const resume = h("button", { class: "ghost small", title: saved.repoDir ?? "" }, [
+        icon(ICONS.loop),
+        "Resume",
+      ]);
+      resume.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        resume.setAttribute("disabled", "true");
+        try {
+          await startRun({
+            goal: saved.goal,
+            env: saved.env,
+            ...(saved.repoDir ? { repoDir: saved.repoDir } : {}),
+            sessionId: s.id,
+            resume: true,
+          });
+          renderMonitor(s.id, saved.goal);
+        } catch (err) {
+          resume.removeAttribute("disabled");
+          alert(`Resume failed: ${(err as Error).message}`);
+        }
+      });
+      row.append(resume);
+    }
+
+    li.append(row);
     list.append(li);
   }
   card.append(list);
@@ -782,6 +1174,7 @@ async function renderSecrets(): Promise<void> {
   function renderCatalog(stored: Set<string>): void {
     catalogList.innerHTML = "";
     for (const provider of MODEL_CATALOG) {
+      if (provider.kind !== "http" || !provider.apiKeyEnv) continue; // CLI agents have no key
       const has = stored.has(provider.apiKeyEnv);
       const head = h("div", { class: "key-cat-head" }, [
         icon(ICONS.key, "key-cat-ico"),
@@ -790,9 +1183,7 @@ async function renderSecrets(): Promise<void> {
         h("span", { class: `key-cat-status ${has ? "on" : "off"}` }, [has ? "stored" : "not stored"]),
       ]);
       const models = h("div", { class: "key-cat-models" });
-      for (const m of provider.models) {
-        models.append(h("span", { class: "model-tag" }, [m.label]));
-      }
+      for (const m of provider.models) models.append(h("span", { class: "model-tag" }, [m.label]));
       catalogList.append(h("div", { class: `key-cat${has ? " on" : ""}` }, [head, models]));
     }
   }

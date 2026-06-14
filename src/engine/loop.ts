@@ -118,8 +118,9 @@ type ReviewOutcome =
 async function askCritic(
   critic: Critic,
   baseReq: CriticRequest,
+  cwd: string,
 ): Promise<{ resp: CriticRawResponse; req: CriticRequest }> {
-  const resp = await critic.review(baseReq);
+  const resp = await critic.review(baseReq, cwd);
   return { resp, req: baseReq };
 }
 
@@ -133,7 +134,7 @@ async function fallbackUnavailable(
   }
   // actor self-review: best-effort, clearly marked as NOT a real critic pass.
   try {
-    const resp = await deps.actor.selfReview(bundle);
+    const resp = await deps.actor.selfReview(bundle, deps.cwd);
     const parsed = parseCriticResponse(resp.text);
     // Only carry NON-blocking findings forward: in the degraded path these
     // become informational nits, and a blocker mislabeled as a nit would be
@@ -158,7 +159,7 @@ async function obtainTaskReview(
   bundle: TaskArtifactBundle,
 ): Promise<ReviewOutcome> {
   // attempt 1
-  let { resp } = await askCritic(deps.critic, { kind: "task", bundle });
+  let { resp } = await askCritic(deps.critic, { kind: "task", bundle }, deps.cwd);
   if (resp.quotaExhausted) return fallbackUnavailable(deps, bundle);
 
   let parsed = parseCriticResponse(resp.text);
@@ -169,7 +170,7 @@ async function obtainTaskReview(
       kind: "task",
       bundle,
       repairHint: REPAIR_HINT,
-    })).resp;
+    }, deps.cwd)).resp;
     if (resp.quotaExhausted) return fallbackUnavailable(deps, bundle);
     parsed = parseCriticResponse(resp.text);
     if (!parsed.ok) {
@@ -255,7 +256,7 @@ export async function runTask(
         buildAttempts++;
         let guardedBuild: Guarded<ActorBuildResult>;
         try {
-          guardedBuild = await guardProgress(deps.actor.build(task, feedback), stuckThresholdMs);
+          guardedBuild = await guardProgress(deps.actor.build(task, feedback, deps.cwd), stuckThresholdMs);
         } catch (err) {
           // An actor/model failure (quota, unusable output, transport) is
           // task-fatal, not session-fatal: degrade this task to NEEDS_HUMAN
@@ -412,13 +413,13 @@ async function obtainPlanReview(
   goal: string,
   plan: Plan,
 ): Promise<ReviewOutcome> {
-  let resp = await deps.critic.review({ kind: "plan", goal, plan });
+  let resp = await deps.critic.review({ kind: "plan", goal, plan }, deps.cwd);
   if (resp.quotaExhausted) {
     return { kind: "unavailable", selfReviewNotes: [], reason: "Critic unavailable for plan review." };
   }
   let parsed = parseCriticResponse(resp.text);
   if (!parsed.ok) {
-    resp = await deps.critic.review({ kind: "plan", goal, plan, repairHint: REPAIR_HINT });
+    resp = await deps.critic.review({ kind: "plan", goal, plan, repairHint: REPAIR_HINT }, deps.cwd);
     if (resp.quotaExhausted) {
       return { kind: "unavailable", selfReviewNotes: [], reason: "Critic unavailable for plan review." };
     }

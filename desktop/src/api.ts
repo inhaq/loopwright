@@ -77,6 +77,8 @@ export interface StartRunBody {
   env?: Record<string, string>;
   sessionId?: string;
   resume?: boolean;
+  /** absolute path to the local git repo the run should build against */
+  repoDir?: string;
 }
 
 export async function startRun(body: StartRunBody): Promise<string> {
@@ -176,4 +178,32 @@ export async function setSecret(key: string, value: string): Promise<void> {
 
 export async function deleteSecret(key: string): Promise<void> {
   await tauriInvoke<void>("delete_secret", { key });
+}
+
+// --- Repo selection + environment checks (Tauri only) ----------------------
+
+/**
+ * Opens the native folder picker and returns the chosen absolute path, or null
+ * if the user cancelled. Only available in the desktop app; in a browser there
+ * is no filesystem access, so callers fall back to a manual path input.
+ */
+export async function pickDirectory(): Promise<string | null> {
+  if (!isTauri()) return null;
+  return tauriInvoke<string | null>("pick_directory");
+}
+
+/** Whether the given path is a git working tree (Tauri only; null = unknown). */
+export async function checkGitRepo(path: string): Promise<boolean | null> {
+  if (!isTauri()) return null;
+  return tauriInvoke<boolean>("check_git_repo", { path });
+}
+
+/**
+ * Detects which of the named CLI tools are installed/on PATH (e.g. codex, kiro,
+ * gh). Used for provider onboarding ("installed / missing"). Returns an empty
+ * map in a browser, where local command detection isn't possible.
+ */
+export async function detectCommands(names: string[]): Promise<Record<string, boolean>> {
+  if (!isTauri()) return {};
+  return tauriInvoke<Record<string, boolean>>("which_commands", { names });
 }
