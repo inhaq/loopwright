@@ -1,7 +1,7 @@
 {
   "productName": "Loopwright",
   "version": "0.1.0",
-  "identifier": "dev.loopwright.desktop",
+  "identifier": "com.github.inhaq.loopwright",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
