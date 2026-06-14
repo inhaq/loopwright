@@ -144,84 +144,67 @@ const EXAMPLE_GOALS = [
 ];
 
 function renderStart(): void {
-  const page = h("section", { class: "page" });
+  const page = h("section", { class: "composer-page" });
 
-  // Header
+  // -- Hero
   page.append(
-    h("div", { class: "page-head" }, [
-      h("div", { class: "eyebrow" }, ["Actor – Critic loop"]),
-      h("h1", {}, ["Start a new run"]),
-      h("p", { class: "page-sub" }, [
-        "Describe a goal in plain language. Loopwright plans the work, an actor agent implements it, a critic agent reviews each change, and the loop repeats until the work is verified.",
+    h("div", { class: "hero" }, [
+      h("div", { class: "eyebrow" }, [icon(ICONS.loop), "Actor – Critic loop"]),
+      h("h1", {}, ["What should we build?"]),
+      h("p", {}, [
+        "Describe a goal in plain language. Loopwright plans it, an actor writes the code, a critic reviews every change, and the loop repeats until the work is verified.",
       ]),
     ]),
   );
 
-  // How it works
-  const steps = h("div", { class: "steps" });
-  const stepData: Array<[string, string, string, string]> = [
-    ["1", ICONS.plan, "Plan", "The goal is broken into small, independently verifiable tasks."],
-    ["2", ICONS.loop, "Build & critique", "An actor writes code; a critic reviews it. They iterate until it holds up."],
-    ["3", ICONS.verify, "Verify & integrate", "Mechanical checks run, branches merge, and results are traced end to end."],
-  ];
-  for (const [n, p, title, desc] of stepData) {
-    steps.append(
-      h("div", { class: "step", "data-n": n }, [
-        icon(p, "step-ico"),
-        h("h4", {}, [title]),
-        h("p", {}, [desc]),
-      ]),
-    );
-  }
-  page.append(steps);
-
-  // Form
-  const form = h("form", { class: "card form" });
-
-  // -- Goal field
-  const goalField = h("div", { class: "field" });
+  // -- Composer card (textarea + integrated toolbar)
+  const form = h("form", { class: "composer" });
   const goalArea = h("textarea", {
     name: "goal",
+    class: "goal",
     rows: "3",
     placeholder: "e.g. Add a /healthz endpoint that returns 200 and write a test for it",
     required: "true",
   }) as HTMLTextAreaElement;
-  const chips = h("div", { class: "chips" });
-  for (const ex of EXAMPLE_GOALS) {
-    const chip = h("button", { type: "button", class: "chip" }, [ex]);
-    chip.addEventListener("click", () => {
-      goalArea.value = ex;
-      goalArea.focus();
-    });
-    chips.append(chip);
-  }
-  goalField.append(
-    h("div", { class: "label" }, ["Goal"]),
-    h("div", { class: "desc" }, ["What should the agents accomplish? Be specific about the outcome you expect."]),
-    goalArea,
-    chips,
-  );
 
-  // -- Model / runner field
-  const runnerField = h("div", { class: "field" });
+  // Auto-grow the composer as the user types.
+  const autoGrow = (): void => {
+    goalArea.style.height = "auto";
+    goalArea.style.height = `${Math.min(goalArea.scrollHeight, 320)}px`;
+  };
+  goalArea.addEventListener("input", autoGrow);
+
+  // Provider preset select, styled as a compact toolbar pill.
   const presetSelect = h("select", { name: "preset" }) as HTMLSelectElement;
   for (const [key, p] of Object.entries(PRESETS)) {
     presetSelect.append(h("option", { value: key }, [p.label]));
   }
+  const providerTool = h("div", { class: "tool has-select", title: "Model provider" }, [
+    icon('<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 1v2"/><path d="M15 1v2"/><path d="M9 21v2"/><path d="M15 21v2"/><path d="M1 9h2"/><path d="M1 15h2"/><path d="M21 9h2"/><path d="M21 15h2"/>'),
+    presetSelect,
+  ]);
+
+  // Options popover (max parallel, worktrees, mechanical gate).
   const runnersArea = h("textarea", { name: "runners", rows: "10", spellcheck: "false", class: "mono" }) as HTMLTextAreaElement;
   runnersArea.value = PRESETS.openai!.json;
 
-  const advanced = h("details", { class: "advanced" });
-  const summary = h("summary", {}, [icon(ICONS.caret, "caret"), "Advanced — edit runner profiles (JSON)"]);
-  advanced.append(
-    summary,
-    h("div", { class: "advanced-body" }, [
-      runnersArea,
-      h("small", { class: "desc" }, [
-        "Maps to LOOPWRIGHT_RUNNERS. API keys are referenced by env var name (apiKeyEnv) and resolved from secure storage — never pasted here.",
-      ]),
-    ]),
-  );
+  const actorInput = h("input", { type: "text", name: "actor", value: "primary", list: "runner-ids" }) as HTMLInputElement;
+  const criticInput = h("input", { type: "text", name: "critic", value: "primary", list: "runner-ids" }) as HTMLInputElement;
+  const idDatalist = h("datalist", { id: "runner-ids" });
+
+  function syncRunnerIds(): void {
+    idDatalist.innerHTML = "";
+    try {
+      const arr = JSON.parse(runnersArea.value) as Array<{ id?: string }>;
+      const ids = arr.map((r) => r.id).filter((x): x is string => typeof x === "string");
+      for (const id of ids) idDatalist.append(h("option", { value: id }));
+      if (ids[0] && !ids.includes(actorInput.value)) actorInput.value = ids[0];
+      if (ids[0] && !ids.includes(criticInput.value)) criticInput.value = ids[0];
+    } catch {
+      /* invalid JSON — leave inputs as-is, validated on submit */
+    }
+  }
+  runnersArea.addEventListener("input", syncRunnerIds);
 
   presetSelect.addEventListener("change", () => {
     const p = PRESETS[presetSelect.value];
@@ -230,49 +213,6 @@ function renderStart(): void {
       syncRunnerIds();
     }
   });
-
-  runnerField.append(
-    h("div", { class: "label" }, ["Model provider"]),
-    h("div", { class: "desc" }, ["Pick a preset to get started, or open Advanced to define your own runner profiles."]),
-    presetSelect,
-    advanced,
-  );
-
-  // -- Roles
-  const rolesGrid = h("div", { class: "field-grid" });
-  const actorInput = h("input", { type: "text", name: "actor", value: "primary", list: "runner-ids" }) as HTMLInputElement;
-  const criticInput = h("input", { type: "text", name: "critic", value: "primary", list: "runner-ids" }) as HTMLInputElement;
-  const idDatalist = h("datalist", { id: "runner-ids" });
-  rolesGrid.append(
-    h("label", { class: "inline-label" }, ["Actor runner", h("span", { class: "desc" }, ["Writes the code"]), actorInput]),
-    h("label", { class: "inline-label" }, ["Critic runner", h("span", { class: "desc" }, ["Reviews the code"]), criticInput]),
-    idDatalist,
-  );
-  const rolesField = h("div", { class: "field" }, [
-    h("div", { class: "label" }, ["Roles"]),
-    h("div", { class: "desc" }, ["Which runner profile plays each role. They can be the same."]),
-    rolesGrid,
-  ]);
-
-  function syncRunnerIds(): void {
-    idDatalist.innerHTML = "";
-    try {
-      const arr = JSON.parse(runnersArea.value) as Array<{ id?: string }>;
-      const ids = arr.map((r) => r.id).filter((x): x is string => typeof x === "string");
-      for (const id of ids) idDatalist.append(h("option", { value: id }));
-      // If current actor/critic aren't valid ids, point them at the first one.
-      if (ids[0] && !ids.includes(actorInput.value)) actorInput.value = ids[0];
-      if (ids[0] && !ids.includes(criticInput.value)) criticInput.value = ids[0];
-    } catch {
-      /* invalid JSON — leave inputs as-is, validated on submit */
-    }
-  }
-  runnersArea.addEventListener("input", syncRunnerIds);
-  syncRunnerIds();
-
-  // -- Options
-  const optionsField = h("div", { class: "field" });
-  const options = h("div", { class: "options" });
 
   function optionRow(name: string, title: string, desc: string, checked: boolean): HTMLElement {
     const input = h("input", { type: "checkbox", name }) as HTMLInputElement;
@@ -283,7 +223,6 @@ function renderStart(): void {
     ]);
   }
 
-  // Max parallel stepper
   const parallelInput = h("input", { type: "number", name: "maxParallel", min: "1", value: "2" }) as HTMLInputElement;
   const dec = h("button", { type: "button", "aria-label": "decrease" }, [icon("<path d='M5 12h14'/>")]);
   const inc = h("button", { type: "button", "aria-label": "increase" }, [icon("<path d='M12 5v14'/><path d='M5 12h14'/>")]);
@@ -291,22 +230,96 @@ function renderStart(): void {
   inc.addEventListener("click", () => { parallelInput.value = String(Number(parallelInput.value || "1") + 1); });
   const stepper = h("div", { class: "stepper" }, [parallelInput, h("div", { class: "steps-btns" }, [inc, dec])]);
 
-  options.append(
+  const popover = h("div", { class: "popover", hidden: "true" }, [
     h("div", { class: "option" }, [
-      h("div", { class: "option-text" }, [h("strong", {}, ["Max parallel tasks"]), h("span", {}, ["How many tasks run at the same time."])]),
+      h("div", { class: "option-text" }, [h("strong", {}, ["Max parallel tasks"]), h("span", {}, ["How many tasks run at once."])]),
       stepper,
     ]),
-    optionRow("worktrees", "Use git worktrees", "Isolate each task in its own worktree so parallel work never collides.", false),
-    optionRow("gate", "Mechanical gate", "Run build / test / lint checks before the critic reviews each change.", true),
-  );
-  optionsField.append(h("div", { class: "label" }, ["Options"]), options);
+    optionRow("worktrees", "Use git worktrees", "Isolate each task in its own worktree.", false),
+    optionRow("gate", "Mechanical gate", "Run build / test / lint before the critic reviews.", true),
+  ]);
+  const optionsTool = h("div", { class: "tool", title: "Run options" }, [
+    icon('<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>'),
+    h("span", {}, ["Options"]),
+  ]);
+  optionsTool.addEventListener("click", () => {
+    popover.hidden = !popover.hidden;
+    optionsTool.classList.toggle("active", !popover.hidden);
+  });
+  const optionsWrap = h("div", { class: "popover-wrap" }, [optionsTool, popover]);
 
-  // -- Submit
   const hint = h("span", { class: "hint", id: "start-hint" });
-  const submit = h("button", { type: "submit", class: "primary" }, [icon(ICONS.rocket), "Start run"]);
-  const actions = h("div", { class: "actions" }, [submit, hint]);
+  const submit = h("button", { type: "submit", class: "send-btn" }, [
+    "Start run",
+    icon('<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>'),
+  ]);
 
-  form.append(goalField, runnerField, rolesField, optionsField, actions);
+  const toolbar = h("div", { class: "composer-toolbar" }, [
+    providerTool,
+    optionsWrap,
+    h("span", { class: "spacer" }),
+    submit,
+  ]);
+  form.append(goalArea, toolbar);
+
+  // -- Example goal chips
+  const chips = h("div", { class: "chips" }, [h("span", { class: "chips-label" }, ["Try:"])]);
+  for (const ex of EXAMPLE_GOALS) {
+    const chip = h("button", { type: "button", class: "chip" }, [ex]);
+    chip.addEventListener("click", () => {
+      goalArea.value = ex;
+      autoGrow();
+      goalArea.focus();
+    });
+    chips.append(chip);
+  }
+
+  // -- How it works (slim strip)
+  const how = h("div", { class: "how" });
+  const stepData: Array<[string, string, string]> = [
+    ["1", "Plan", "The goal is split into small, independently verifiable tasks."],
+    ["2", "Build & critique", "An actor writes code; a critic reviews until it holds up."],
+    ["3", "Verify & integrate", "Mechanical checks run, branches merge, results are traced."],
+  ];
+  for (const [n, title, desc] of stepData) {
+    how.append(
+      h("div", { class: "how-item" }, [
+        h("div", { class: "how-top" }, [h("span", { class: "num" }, [n]), h("h4", {}, [title])]),
+        h("p", {}, [desc]),
+      ]),
+    );
+  }
+
+  // -- Advanced runner profiles (JSON)
+  const advanced = h("details", { class: "advanced" });
+  advanced.append(
+    h("summary", {}, [icon(ICONS.caret, "caret"), "Advanced — runner profiles & roles"]),
+    h("div", { class: "advanced-body" }, [
+      h("div", { class: "field" }, [
+        h("div", { class: "label" }, ["Runner profiles (JSON)"]),
+        runnersArea,
+        h("small", { class: "desc" }, [
+          "Maps to LOOPWRIGHT_RUNNERS. API keys are referenced by env var name (apiKeyEnv) and resolved from secure storage — never pasted here.",
+        ]),
+      ]),
+      h("div", { class: "field" }, [
+        h("div", { class: "label" }, ["Roles"]),
+        h("div", { class: "field-grid" }, [
+          h("label", { class: "inline-label" }, ["Actor runner", h("span", { class: "desc" }, ["Writes the code"]), actorInput]),
+          h("label", { class: "inline-label" }, ["Critic runner", h("span", { class: "desc" }, ["Reviews the code"]), criticInput]),
+        ]),
+        idDatalist,
+      ]),
+    ]),
+  );
+
+  syncRunnerIds();
+
+  // -- Submit handling
+  // Cmd/Ctrl+Enter submits from the textarea.
+  goalArea.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") form.requestSubmit();
+  });
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -318,9 +331,9 @@ function renderStart(): void {
     }
 
     const env: Record<string, string> = {
-      LOOPWRIGHT_RUNNERS: String(data.get("runners") ?? "").trim(),
-      LOOPWRIGHT_ACTOR_RUNNER: String(data.get("actor") ?? "").trim(),
-      LOOPWRIGHT_CRITIC_RUNNER: String(data.get("critic") ?? "").trim(),
+      LOOPWRIGHT_RUNNERS: runnersArea.value.trim(),
+      LOOPWRIGHT_ACTOR_RUNNER: actorInput.value.trim(),
+      LOOPWRIGHT_CRITIC_RUNNER: criticInput.value.trim(),
       LOOPWRIGHT_MAX_PARALLEL: String(data.get("maxParallel") ?? "2"),
       LOOPWRIGHT_USE_WORKTREES: data.get("worktrees") ? "true" : "false",
       LOOPWRIGHT_MECHANICAL_GATE: data.get("gate") ? "true" : "false",
@@ -332,12 +345,14 @@ function renderStart(): void {
     } catch (err) {
       advanced.setAttribute("open", "true");
       hint.textContent = `Runner profiles must be valid JSON: ${(err as Error).message}`;
-      hint.className = "hint error";
+      hint.className = "hint error center-hint";
+      page.append(hint);
       return;
     }
 
     hint.textContent = "Starting…";
-    hint.className = "hint";
+    hint.className = "hint center-hint";
+    page.append(hint);
     submit.setAttribute("disabled", "true");
     try {
       const sessionId = await startRun({ goal, env });
@@ -345,12 +360,14 @@ function renderStart(): void {
     } catch (err) {
       submit.removeAttribute("disabled");
       hint.textContent = `Failed to start: ${(err as Error).message}`;
-      hint.className = "hint error";
+      hint.className = "hint error center-hint";
+      page.append(hint);
     }
   });
 
-  page.append(form);
+  page.append(form, chips, how, advanced);
   view.append(page);
+  goalArea.focus();
 }
 
 // --- Monitor view -----------------------------------------------------------
