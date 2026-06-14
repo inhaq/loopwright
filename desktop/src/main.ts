@@ -18,6 +18,7 @@ import type { RunMessage, SessionRecord, TraceResponse } from "./types.js";
 
 const view = document.getElementById("view") as HTMLElement;
 const engineStatus = document.getElementById("engine-status") as HTMLElement;
+const engineLabel = engineStatus.querySelector(".engine-label") as HTMLElement;
 
 // --- tiny DOM helpers -------------------------------------------------------
 
@@ -29,6 +30,7 @@ function h<K extends keyof HTMLElementTagNameMap>(
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (k === "class") node.className = v;
+    else if (k === "html") node.innerHTML = v;
     else node.setAttribute(k, v);
   }
   for (const c of children) node.append(c);
@@ -38,6 +40,24 @@ function h<K extends keyof HTMLElementTagNameMap>(
 function badge(state: string): HTMLElement {
   return h("span", { class: `badge state-${state}` }, [state]);
 }
+
+/** Inline SVG icon as an element (24x24 viewBox, stroke-based). */
+function icon(path: string, cls = ""): HTMLElement {
+  const span = h("span", cls ? { class: cls } : {});
+  span.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${path}</svg>`;
+  return span;
+}
+
+const ICONS = {
+  plan: '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+  loop: '<path d="M17 2.1a9 9 0 1 0 4.9 9.4"/><path d="M21 3v5h-5"/>',
+  verify: '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="M22 4 12 14.01l-3-3"/>',
+  rocket: '<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>',
+  inbox: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+  key: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  arrow: '<path d="M9 18l6-6-6-6"/>',
+  caret: '<path d="M9 18l6-6-6-6"/>',
+};
 
 /** Valid POSIX-ish environment variable name (used for secret keys). */
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -52,68 +72,251 @@ function navigate(nav: Nav, arg?: string): void {
     teardown();
     teardown = null;
   }
-  document.querySelectorAll("nav button").forEach((b) => {
+  document.querySelectorAll(".nav-item").forEach((b) => {
     b.classList.toggle("active", (b as HTMLElement).dataset.nav === nav);
   });
   view.innerHTML = "";
+  view.scrollTop = 0;
   if (nav === "start") renderStart();
   else if (nav === "sessions") renderSessions();
   else if (nav === "secrets") renderSecrets();
   void arg;
 }
 
-document.querySelectorAll("nav button").forEach((b) => {
+document.querySelectorAll(".nav-item").forEach((b) => {
   b.addEventListener("click", () => navigate((b as HTMLElement).dataset.nav as Nav));
 });
 
+function clearNavActive(): void {
+  document.querySelectorAll(".nav-item").forEach((b) => b.classList.remove("active"));
+}
+
 // --- Start view -------------------------------------------------------------
 
-const SAMPLE_RUNNERS = JSON.stringify(
-  [
-    {
-      id: "primary",
-      kind: "http",
-      model: "gpt-4o-mini",
-      options: { baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" },
-    },
-  ],
-  null,
-  2,
-);
+interface Preset {
+  label: string;
+  json: string;
+}
+
+const PRESETS: Record<string, Preset> = {
+  openai: {
+    label: "OpenAI (gpt-4o-mini)",
+    json: JSON.stringify(
+      [{ id: "primary", kind: "http", model: "gpt-4o-mini", options: { baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" } }],
+      null,
+      2,
+    ),
+  },
+  anthropic: {
+    label: "Anthropic (claude-3-5-sonnet)",
+    json: JSON.stringify(
+      [{ id: "primary", kind: "http", model: "claude-3-5-sonnet-latest", options: { baseUrl: "https://api.anthropic.com/v1", apiKeyEnv: "ANTHROPIC_API_KEY" } }],
+      null,
+      2,
+    ),
+  },
+  local: {
+    label: "Local (Ollama / OpenAI-compatible)",
+    json: JSON.stringify(
+      [{ id: "primary", kind: "http", model: "llama3.1", options: { baseUrl: "http://localhost:11434/v1", apiKeyEnv: "OLLAMA_API_KEY" } }],
+      null,
+      2,
+    ),
+  },
+  split: {
+    label: "Split actor + critic",
+    json: JSON.stringify(
+      [
+        { id: "builder", kind: "http", model: "gpt-4o-mini", options: { baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" } },
+        { id: "reviewer", kind: "http", model: "gpt-4o", options: { baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" } },
+      ],
+      null,
+      2,
+    ),
+  },
+};
+
+const EXAMPLE_GOALS = [
+  "Add a /healthz endpoint with a test",
+  "Fix the failing auth middleware tests",
+  "Add input validation to the signup form",
+  "Refactor the config loader to use zod",
+];
 
 function renderStart(): void {
+  const page = h("section", { class: "page" });
+
+  // Header
+  page.append(
+    h("div", { class: "page-head" }, [
+      h("div", { class: "eyebrow" }, ["Actor – Critic loop"]),
+      h("h1", {}, ["Start a new run"]),
+      h("p", { class: "page-sub" }, [
+        "Describe a goal in plain language. Loopwright plans the work, an actor agent implements it, a critic agent reviews each change, and the loop repeats until the work is verified.",
+      ]),
+    ]),
+  );
+
+  // How it works
+  const steps = h("div", { class: "steps" });
+  const stepData: Array<[string, string, string, string]> = [
+    ["1", ICONS.plan, "Plan", "The goal is broken into small, independently verifiable tasks."],
+    ["2", ICONS.loop, "Build & critique", "An actor writes code; a critic reviews it. They iterate until it holds up."],
+    ["3", ICONS.verify, "Verify & integrate", "Mechanical checks run, branches merge, and results are traced end to end."],
+  ];
+  for (const [n, p, title, desc] of stepData) {
+    steps.append(
+      h("div", { class: "step", "data-n": n }, [
+        icon(p, "step-ico"),
+        h("h4", {}, [title]),
+        h("p", {}, [desc]),
+      ]),
+    );
+  }
+  page.append(steps);
+
+  // Form
   const form = h("form", { class: "card form" });
-  form.innerHTML = `
-    <h2>Start a run</h2>
-    <label>Goal
-      <textarea name="goal" rows="3" placeholder="e.g. Add a /healthz endpoint with a test" required></textarea>
-    </label>
-    <label>Runner profiles (JSON)
-      <textarea name="runners" rows="8" spellcheck="false"></textarea>
-      <small>Maps to <code>LOOPWRIGHT_RUNNERS</code>. API keys are referenced by env var name (<code>apiKeyEnv</code>) and resolved from secure storage.</small>
-    </label>
-    <div class="row">
-      <label>Actor runner id<input name="actor" value="primary" /></label>
-      <label>Critic runner id<input name="critic" value="primary" /></label>
-    </div>
-    <div class="row">
-      <label>Max parallel<input name="maxParallel" type="number" min="1" value="2" /></label>
-      <label class="check"><input name="worktrees" type="checkbox" /> Use git worktrees</label>
-      <label class="check"><input name="gate" type="checkbox" checked /> Mechanical gate</label>
-    </div>
-    <div class="actions">
-      <button type="submit" class="primary">Start run</button>
-      <span class="hint" id="start-hint"></span>
-    </div>
-  `;
-  (form.querySelector("[name=runners]") as HTMLTextAreaElement).value = SAMPLE_RUNNERS;
+
+  // -- Goal field
+  const goalField = h("div", { class: "field" });
+  const goalArea = h("textarea", {
+    id: "start-goal",
+    name: "goal",
+    rows: "3",
+    placeholder: "e.g. Add a /healthz endpoint that returns 200 and write a test for it",
+    required: "true",
+  }) as HTMLTextAreaElement;
+  const chips = h("div", { class: "chips" });
+  for (const ex of EXAMPLE_GOALS) {
+    const chip = h("button", { type: "button", class: "chip" }, [ex]);
+    chip.addEventListener("click", () => {
+      goalArea.value = ex;
+      goalArea.focus();
+    });
+    chips.append(chip);
+  }
+  goalField.append(
+    h("label", { class: "label", for: "start-goal" }, ["Goal"]),
+    h("div", { class: "desc" }, ["What should the agents accomplish? Be specific about the outcome you expect."]),
+    goalArea,
+    chips,
+  );
+
+  // -- Model / runner field
+  const runnerField = h("div", { class: "field" });
+  const presetSelect = h("select", { id: "start-preset", name: "preset" }) as HTMLSelectElement;
+  for (const [key, p] of Object.entries(PRESETS)) {
+    presetSelect.append(h("option", { value: key }, [p.label]));
+  }
+  const runnersArea = h("textarea", { name: "runners", rows: "10", spellcheck: "false", class: "mono", "aria-label": "Runner profiles (JSON)" }) as HTMLTextAreaElement;
+  runnersArea.value = PRESETS.openai!.json;
+
+  const advanced = h("details", { class: "advanced" });
+  const summary = h("summary", {}, [icon(ICONS.caret, "caret"), "Advanced — edit runner profiles (JSON)"]);
+  advanced.append(
+    summary,
+    h("div", { class: "advanced-body" }, [
+      runnersArea,
+      h("small", { class: "desc" }, [
+        "Maps to LOOPWRIGHT_RUNNERS. API keys are referenced by env var name (apiKeyEnv) and resolved from secure storage — never pasted here.",
+      ]),
+    ]),
+  );
+
+  presetSelect.addEventListener("change", () => {
+    const p = PRESETS[presetSelect.value];
+    if (p) {
+      runnersArea.value = p.json;
+      syncRunnerIds();
+    }
+  });
+
+  runnerField.append(
+    h("label", { class: "label", for: "start-preset" }, ["Model provider"]),
+    h("div", { class: "desc" }, ["Pick a preset to get started, or open Advanced to define your own runner profiles."]),
+    presetSelect,
+    advanced,
+  );
+
+  // -- Roles
+  const rolesGrid = h("div", { class: "field-grid" });
+  const actorInput = h("input", { type: "text", name: "actor", value: "primary", list: "runner-ids" }) as HTMLInputElement;
+  const criticInput = h("input", { type: "text", name: "critic", value: "primary", list: "runner-ids" }) as HTMLInputElement;
+  const idDatalist = h("datalist", { id: "runner-ids" });
+  rolesGrid.append(
+    h("label", { class: "inline-label" }, ["Actor runner", h("span", { class: "desc" }, ["Writes the code"]), actorInput]),
+    h("label", { class: "inline-label" }, ["Critic runner", h("span", { class: "desc" }, ["Reviews the code"]), criticInput]),
+    idDatalist,
+  );
+  const rolesField = h("div", { class: "field" }, [
+    h("div", { class: "label" }, ["Roles"]),
+    h("div", { class: "desc" }, ["Which runner profile plays each role. They can be the same."]),
+    rolesGrid,
+  ]);
+
+  function syncRunnerIds(): void {
+    idDatalist.innerHTML = "";
+    try {
+      const arr = JSON.parse(runnersArea.value) as Array<{ id?: string }>;
+      const ids = arr.map((r) => r.id).filter((x): x is string => typeof x === "string");
+      for (const id of ids) idDatalist.append(h("option", { value: id }));
+      // If current actor/critic aren't valid ids, point them at the first one.
+      if (ids[0] && !ids.includes(actorInput.value)) actorInput.value = ids[0];
+      if (ids[0] && !ids.includes(criticInput.value)) criticInput.value = ids[0];
+    } catch {
+      /* invalid JSON — leave inputs as-is, validated on submit */
+    }
+  }
+  runnersArea.addEventListener("input", syncRunnerIds);
+  syncRunnerIds();
+
+  // -- Options
+  const optionsField = h("div", { class: "field" });
+  const options = h("div", { class: "options" });
+
+  function optionRow(name: string, title: string, desc: string, checked: boolean): HTMLElement {
+    const input = h("input", { type: "checkbox", name, "aria-label": title }) as HTMLInputElement;
+    if (checked) input.checked = true;
+    return h("div", { class: "option" }, [
+      h("div", { class: "option-text" }, [h("strong", {}, [title]), h("span", {}, [desc])]),
+      h("label", { class: "switch" }, [input, h("span", { class: "track" })]),
+    ]);
+  }
+
+  // Max parallel stepper
+  const parallelInput = h("input", { type: "number", name: "maxParallel", min: "1", value: "2", "aria-label": "Max parallel tasks" }) as HTMLInputElement;
+  const dec = h("button", { type: "button", "aria-label": "decrease" }, [icon("<path d='M5 12h14'/>")]);
+  const inc = h("button", { type: "button", "aria-label": "increase" }, [icon("<path d='M12 5v14'/><path d='M5 12h14'/>")]);
+  dec.addEventListener("click", () => { parallelInput.value = String(Math.max(1, Number(parallelInput.value || "1") - 1)); });
+  inc.addEventListener("click", () => { parallelInput.value = String(Number(parallelInput.value || "1") + 1); });
+  const stepper = h("div", { class: "stepper" }, [parallelInput, h("div", { class: "steps-btns" }, [inc, dec])]);
+
+  options.append(
+    h("div", { class: "option" }, [
+      h("div", { class: "option-text" }, [h("strong", {}, ["Max parallel tasks"]), h("span", {}, ["How many tasks run at the same time."])]),
+      stepper,
+    ]),
+    optionRow("worktrees", "Use git worktrees", "Isolate each task in its own worktree so parallel work never collides.", false),
+    optionRow("gate", "Mechanical gate", "Run build / test / lint checks before the critic reviews each change.", true),
+  );
+  optionsField.append(h("div", { class: "label" }, ["Options"]), options);
+
+  // -- Submit
+  const hint = h("span", { class: "hint", id: "start-hint" });
+  const submit = h("button", { type: "submit", class: "primary" }, [icon(ICONS.rocket), "Start run"]);
+  const actions = h("div", { class: "actions" }, [submit, hint]);
+
+  form.append(goalField, runnerField, rolesField, optionsField, actions);
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const hint = form.querySelector("#start-hint") as HTMLElement;
     const data = new FormData(form);
     const goal = String(data.get("goal") ?? "").trim();
-    if (!goal) return;
+    if (!goal) {
+      goalArea.focus();
+      return;
+    }
 
     const env: Record<string, string> = {
       LOOPWRIGHT_RUNNERS: String(data.get("runners") ?? "").trim(),
@@ -128,42 +331,65 @@ function renderStart(): void {
       // Validate JSON early so the user gets a clear message, not a 400.
       if (env.LOOPWRIGHT_RUNNERS) JSON.parse(env.LOOPWRIGHT_RUNNERS);
     } catch (err) {
+      advanced.setAttribute("open", "true");
       hint.textContent = `Runner profiles must be valid JSON: ${(err as Error).message}`;
-      hint.classList.add("error");
+      hint.className = "hint error";
       return;
     }
 
     hint.textContent = "Starting…";
-    hint.classList.remove("error");
+    hint.className = "hint";
+    submit.setAttribute("disabled", "true");
     try {
       const sessionId = await startRun({ goal, env });
       renderMonitor(sessionId, goal);
     } catch (err) {
+      submit.removeAttribute("disabled");
       hint.textContent = `Failed to start: ${(err as Error).message}`;
-      hint.classList.add("error");
+      hint.className = "hint error";
     }
   });
 
-  view.append(form);
+  page.append(form);
+  view.append(page);
 }
 
 // --- Monitor view -----------------------------------------------------------
 
 function renderMonitor(sessionId: string, goal: string): void {
-  document.querySelectorAll("nav button").forEach((b) => b.classList.remove("active"));
+  clearNavActive();
   view.innerHTML = "";
+  view.scrollTop = 0;
+  const page = h("section", { class: "page" });
 
-  const header = h("div", { class: "card" });
-  header.innerHTML = `
-    <h2>Live run</h2>
-    <div class="goal">${escapeHtml(goal)}</div>
-    <div class="session-id">session ${escapeHtml(sessionId)}</div>
-    <div id="phase" class="phase running">running…</div>
-    <div id="plan" class="plan"></div>
-  `;
+  // Run header
+  const phase = h("div", { class: "phase running", id: "phase" }, ["running…"]);
+  const plan = h("div", { class: "plan", id: "plan" });
+  const stopBtn = h("button", { class: "danger small" }, ["Stop run"]);
 
-  const usage = h("div", { class: "card usage" });
-  usage.innerHTML = `<h3>Usage</h3><div id="usage-body" class="usage-body">no runner calls yet</div>`;
+  const header = h("div", { class: "card run-head" }, [
+    h("div", { class: "goal" }, [goal]),
+    h("div", { class: "meta-row" }, [phase, stopBtn, h("span", { class: "session-id" }, [`session ${sessionId}`])]),
+    plan,
+  ]);
+
+  // Stop control: requests cooperative cancellation of the in-flight run.
+  stopBtn.addEventListener("click", async () => {
+    stopBtn.setAttribute("disabled", "true");
+    stopBtn.textContent = "Stopping…";
+    try {
+      await cancelRun(sessionId);
+    } catch (err) {
+      stopBtn.removeAttribute("disabled");
+      stopBtn.textContent = "Stop run";
+      plan.textContent = `Cancel failed: ${(err as Error).message}`;
+    }
+  });
+
+  const usage = h("div", { class: "card" }, [
+    h("h3", {}, ["Usage"]),
+    h("div", { class: "usage-body", id: "usage-body" }, ["No runner calls yet."]),
+  ]);
 
   const tasksCard = h("div", { class: "card" }, [h("h3", {}, ["Tasks"])]);
   const tasksTable = h("table", { class: "tasks" });
@@ -174,22 +400,8 @@ function renderMonitor(sessionId: string, goal: string): void {
   const log = h("pre", { class: "log", id: "log" });
   logCard.append(log);
 
-  view.append(header, usage, tasksCard, logCard);
-
-  // Stop control: requests cooperative cancellation of the in-flight run.
-  const stopBtn = h("button", { class: "danger" }, ["Stop run"]);
-  stopBtn.addEventListener("click", async () => {
-    stopBtn.setAttribute("disabled", "true");
-    stopBtn.textContent = "Stopping…";
-    try {
-      await cancelRun(sessionId);
-    } catch (err) {
-      stopBtn.removeAttribute("disabled");
-      stopBtn.textContent = "Stop run";
-      (document.getElementById("plan") as HTMLElement).textContent = `Cancel failed: ${(err as Error).message}`;
-    }
-  });
-  (header.querySelector("#phase") as HTMLElement).append(" ", stopBtn);
+  page.append(header, usage, tasksCard, logCard);
+  view.append(page);
 
   const taskRows = new Map<string, HTMLElement>();
   let actorCalls = 0;
@@ -236,13 +448,13 @@ function renderMonitor(sessionId: string, goal: string): void {
         else if (ev.data.role === "critic") criticCalls++;
         totalTokens += Number(ev.data?.usage?.totalTokens ?? 0);
         (document.getElementById("usage-body") as HTMLElement).textContent =
-          `actor ${actorCalls} calls · critic ${criticCalls} calls · ${totalTokens} tokens`;
+          `actor ${actorCalls} calls · critic ${criticCalls} calls · ${totalTokens.toLocaleString()} tokens`;
       } else if (ev.type === "plan_reviewed") {
         (document.getElementById("plan") as HTMLElement).textContent =
-          `plan: approved=${ev.data.approved} · revisions=${ev.data.revisions} · open items=${ev.data.openItems}`;
+          `Plan: approved=${ev.data.approved} · revisions=${ev.data.revisions} · open items=${ev.data.openItems}`;
       }
     } else if (msg.type === "status") {
-      const phase = document.getElementById("phase") as HTMLElement;
+      const phaseEl = document.getElementById("phase") as HTMLElement;
       if (msg.data.phase === "done" || msg.data.phase === "error") {
         stopBtn.remove(); // run is over; no longer cancellable
       }
@@ -254,21 +466,21 @@ function renderMonitor(sessionId: string, goal: string): void {
         const integrationFailed = r.integration && r.integration.ok === false;
         const needsHuman = Array.isArray(r.needsHuman) && r.needsHuman.length > 0;
         if (integrationFailed) {
-          phase.className = "phase error";
-          phase.textContent = "integration failed — needs attention";
+          phaseEl.className = "phase error";
+          phaseEl.textContent = "Integration failed — needs attention";
         } else if (needsHuman) {
-          phase.className = "phase error";
-          phase.textContent = "completed — some tasks need human attention";
+          phaseEl.className = "phase error";
+          phaseEl.textContent = "Completed — some tasks need a human";
         } else {
-          phase.className = "phase done";
-          phase.textContent = "completed";
+          phaseEl.className = "phase done";
+          phaseEl.textContent = "Completed";
         }
-        const btn = h("button", { class: "primary" }, ["View results"]);
+        const btn = h("button", { class: "primary small" }, ["View results"]);
         btn.addEventListener("click", () => renderResults(sessionId));
-        phase.append(" ", btn);
+        phaseEl.after(btn);
       } else if (msg.data.phase === "error") {
-        phase.className = "phase error";
-        phase.textContent = `error: ${msg.data.error}`;
+        phaseEl.className = "phase error";
+        phaseEl.textContent = `Error: ${msg.data.error}`;
       }
     }
   }
@@ -287,73 +499,69 @@ function renderMonitor(sessionId: string, goal: string): void {
 // --- Results view -----------------------------------------------------------
 
 async function renderResults(sessionId: string): Promise<void> {
-  document.querySelectorAll("nav button").forEach((b) => b.classList.remove("active"));
+  clearNavActive();
   view.innerHTML = "";
-  view.append(h("div", { class: "card" }, ["Loading trace…"]));
+  view.scrollTop = 0;
+  const loadingPage = h("section", { class: "page" }, [
+    h("div", { class: "card" }, [h("div", { class: "loading" }, [h("span", { class: "spinner" }), "Loading trace…"])]),
+  ]);
+  view.append(loadingPage);
 
   let resp: TraceResponse;
   try {
     resp = await getTrace(sessionId);
   } catch (err) {
     view.innerHTML = "";
-    view.append(h("div", { class: "card error" }, [`Failed to load trace: ${(err as Error).message}`]));
+    view.append(
+      h("section", { class: "page" }, [
+        h("div", { class: "card error" }, [`Failed to load trace: ${(err as Error).message}`]),
+      ]),
+    );
     return;
   }
 
   const { trace } = resp;
   view.innerHTML = "";
+  const page = h("section", { class: "page" });
 
-  const summary = h("div", { class: "card" });
   const s = trace.session;
   const byState = countStates(trace);
-  summary.innerHTML = `
-    <h2>Results</h2>
-    <div class="goal">${escapeHtml(s?.goal ?? "")}</div>
-    <div class="session-id">session ${escapeHtml(sessionId)} — ${escapeHtml(s?.status ?? "?")}</div>
-    <div class="counts">
-      <span class="count green">GREEN ${byState.GREEN}</span>
-      <span class="count unverified">UNVERIFIED ${byState.UNVERIFIED_BY_CRITIC}</span>
-      <span class="count needs-human">NEEDS_HUMAN ${byState.NEEDS_HUMAN}</span>
-    </div>
-  `;
 
-  const u = trace.usage;
-  const usage = h("div", { class: "card" });
-  usage.innerHTML = `
-    <h3>Usage</h3>
-    <table class="kv">
-      <tr><th></th><th>calls</th><th>prompt</th><th>completion</th><th>total</th><th>quota hits</th></tr>
-      <tr><td>actor</td><td>${u.perRole.actor.calls}</td><td>${u.perRole.actor.promptTokens}</td><td>${u.perRole.actor.completionTokens}</td><td>${u.perRole.actor.totalTokens}</td><td>${u.perRole.actor.quotaHits}</td></tr>
-      <tr><td>critic</td><td>${u.perRole.critic.calls}</td><td>${u.perRole.critic.promptTokens}</td><td>${u.perRole.critic.completionTokens}</td><td>${u.perRole.critic.totalTokens}</td><td>${u.perRole.critic.quotaHits}</td></tr>
-      <tr class="total"><td>total</td><td>${u.total.calls}</td><td>${u.total.promptTokens}</td><td>${u.total.completionTokens}</td><td>${u.total.totalTokens}</td><td>${u.total.quotaHits}</td></tr>
-    </table>
-  `;
+  // Header
+  const backBtn = h("button", { class: "ghost small" }, [icon("<path d='M19 12H5'/><path d='M12 19l-7-7 7-7'/>"), "All sessions"]);
+  backBtn.addEventListener("click", () => navigate("sessions"));
 
-  const tasksCard = h("div", { class: "card" }, [h("h3", {}, ["Tasks"])]);
-  for (const t of trace.tasks) {
-    const block = h("div", { class: "task-block" });
-    const head = h("div", { class: "task-head" }, [`${t.taskId} `, badge(t.state)]);
-    if (t.degradedReason) head.append(h("span", { class: "degraded" }, [` ${t.degradedReason}`]));
-    block.append(head);
-    const txs = trace.transitions.filter((x) => x.taskId === t.taskId);
-    if (txs.length) {
-      const ul = h("ul", { class: "tx" });
-      for (const x of txs) ul.append(h("li", {}, [`${x.from} —(${x.event})→ ${x.to}  ${x.reason}`]));
-      block.append(ul);
-    }
-    tasksCard.append(block);
-  }
+  const counts = h("div", { class: "counts" }, [
+    h("span", { class: "count green" }, [h("span", { class: "n" }, [String(byState.GREEN)]), "Green"]),
+    h("span", { class: "count unverified" }, [h("span", { class: "n" }, [String(byState.UNVERIFIED_BY_CRITIC)]), "Unverified"]),
+    h("span", { class: "count needs-human" }, [h("span", { class: "n" }, [String(byState.NEEDS_HUMAN)]), "Needs human"]),
+  ]);
+
+  page.append(
+    h("div", { class: "page-head" }, [
+      h("div", { class: "head-row" }, [
+        h("div", { class: "eyebrow" }, ["Run results"]),
+        backBtn,
+      ]),
+      h("h1", {}, [s?.goal ?? "Results"]),
+      h("div", { class: "meta-row" }, [
+        h("span", { class: `phase ${statusPhase(s?.status)}` }, [s?.status ?? "?"]),
+        h("span", { class: "session-id" }, [`session ${sessionId}`]),
+      ]),
+    ]),
+    counts,
+  );
 
   // Blocking summary cards (shown high up so a merge/verify failure can't be
   // missed behind all-green task counts). Sourced from the durable event log.
-  const blocking: HTMLElement[] = [];
-
   const failedEvent = trace.events.find((e) => e.type === "session_failed");
   if (failedEvent) {
-    const card = h("div", { class: "card error" });
-    card.append(h("h3", {}, ["Run failed"]));
-    card.append(h("div", {}, [String((failedEvent.data as Record<string, unknown>).error ?? "unknown error")]));
-    blocking.push(card);
+    page.append(
+      h("div", { class: "card error" }, [
+        h("h3", {}, ["Run failed"]),
+        h("div", {}, [String((failedEvent.data as Record<string, unknown>).error ?? "unknown error")]),
+      ]),
+    );
   }
 
   const integrationEvent = trace.events.find((e) => e.type === "integration");
@@ -372,7 +580,7 @@ async function renderResults(sessionId: string): Promise<void> {
     card.append(h("h3", {}, ["Integration & verification"]));
     card.append(
       h("div", { class: `phase ${ok ? "done" : "error"}` }, [
-        ok ? "branches merged and full verification passed" : "FAILED — merge conflicts or verification did not pass",
+        ok ? "Branches merged and full verification passed" : "Failed — merge conflicts or verification did not pass",
       ]),
     );
     card.append(
@@ -388,13 +596,52 @@ async function renderResults(sessionId: string): Promise<void> {
     if (d.verification && d.verification.passed === false) {
       card.append(h("div", { class: "error" }, ["Full-tree verification failed after merge."]));
     }
-    blocking.push(card);
+    page.append(card);
   }
 
+  // Usage
+  const u = trace.usage;
+  const usage = h("div", { class: "card" });
+  usage.innerHTML = `
+    <h3>Usage</h3>
+    <table class="kv">
+      <tr><th></th><th>calls</th><th>prompt</th><th>completion</th><th>total</th><th>quota hits</th></tr>
+      <tr><td>actor</td><td>${u.perRole.actor.calls}</td><td>${u.perRole.actor.promptTokens}</td><td>${u.perRole.actor.completionTokens}</td><td>${u.perRole.actor.totalTokens}</td><td>${u.perRole.actor.quotaHits}</td></tr>
+      <tr><td>critic</td><td>${u.perRole.critic.calls}</td><td>${u.perRole.critic.promptTokens}</td><td>${u.perRole.critic.completionTokens}</td><td>${u.perRole.critic.totalTokens}</td><td>${u.perRole.critic.quotaHits}</td></tr>
+      <tr class="total"><td>total</td><td>${u.total.calls}</td><td>${u.total.promptTokens}</td><td>${u.total.completionTokens}</td><td>${u.total.totalTokens}</td><td>${u.total.quotaHits}</td></tr>
+    </table>
+  `;
+  page.append(usage);
+
+  // Tasks
+  const tasksCard = h("div", { class: "card" }, [h("h3", {}, ["Tasks"])]);
+  for (const t of trace.tasks) {
+    const block = h("div", { class: "task-block" });
+    const head = h("div", { class: "task-head" }, [`${t.taskId} `, badge(t.state)]);
+    if (t.degradedReason) head.append(h("span", { class: "degraded" }, [` ${t.degradedReason}`]));
+    block.append(head);
+    const txs = trace.transitions.filter((x) => x.taskId === t.taskId);
+    if (txs.length) {
+      const ul = h("ul", { class: "tx" });
+      for (const x of txs) ul.append(h("li", {}, [`${x.from} —(${x.event})→ ${x.to}  ${x.reason}`]));
+      block.append(ul);
+    }
+    tasksCard.append(block);
+  }
+  page.append(tasksCard);
+
+  // Raw trace
   const raw = h("details", { class: "card" });
   raw.append(h("summary", {}, ["Raw trace (text)"]), h("pre", { class: "log" }, [resp.text]));
+  page.append(raw);
 
-  view.append(summary, ...blocking, usage, tasksCard, raw);
+  view.append(page);
+}
+
+function statusPhase(status?: string): string {
+  if (status === "completed") return "done";
+  if (status === "failed" || status === "needs_human") return "error";
+  return "running";
 }
 
 function countStates(trace: TraceResponse["trace"]): Record<string, number> {
@@ -407,25 +654,55 @@ function countStates(trace: TraceResponse["trace"]): Record<string, number> {
 
 async function renderSessions(): Promise<void> {
   view.innerHTML = "";
-  const card = h("div", { class: "card" }, [h("h2", {}, ["Sessions"])]);
-  view.append(card);
+  const page = h("section", { class: "page" });
+  page.append(
+    h("div", { class: "page-head" }, [
+      h("h1", {}, ["Sessions"]),
+      h("p", { class: "page-sub" }, ["Every run you've started. Select one to view its trace, usage, and task outcomes."]),
+    ]),
+  );
+  const card = h("div", { class: "card" });
+  page.append(card);
+  view.append(page);
+
+  card.append(h("div", { class: "loading" }, [h("span", { class: "spinner" }), "Loading sessions…"]));
+
   let sessions: SessionRecord[];
   try {
     sessions = await listSessions();
   } catch (err) {
+    card.innerHTML = "";
     card.append(h("div", { class: "error" }, [`Failed to load: ${(err as Error).message}`]));
     return;
   }
+
+  card.innerHTML = "";
   if (!sessions.length) {
-    card.append(h("div", { class: "hint" }, ["No runs yet."]));
+    card.append(
+      h("div", { class: "empty" }, [
+        icon(ICONS.inbox, "empty-ico"),
+        h("h3", {}, ["No runs yet"]),
+        h("p", {}, ["Start your first run and it will show up here with its full trace."]),
+        (() => {
+          const b = h("button", { class: "primary small" }, [icon(ICONS.rocket), "New run"]);
+          b.addEventListener("click", () => navigate("start"));
+          return b;
+        })(),
+      ]),
+    );
     return;
   }
+
   const list = h("ul", { class: "session-list" });
   for (const s of sessions) {
     const li = h("li", {});
     const btn = h("button", { class: "linkish" }, [
-      h("span", { class: "s-goal" }, [s.goal]),
-      h("span", { class: "s-meta" }, [`${s.status} · ${new Date(s.createdAt).toLocaleString()}`]),
+      h("div", { class: "s-main" }, [
+        h("span", { class: "s-goal" }, [s.goal]),
+        h("span", { class: "s-meta" }, [`${s.status} · ${new Date(s.createdAt).toLocaleString()}`]),
+      ]),
+      h("span", { class: `badge state-${stateForStatus(s.status)}` }, [s.status]),
+      icon(ICONS.arrow, "s-arrow"),
     ]);
     btn.addEventListener("click", () => renderResults(s.id));
     li.append(btn);
@@ -434,29 +711,45 @@ async function renderSessions(): Promise<void> {
   card.append(list);
 }
 
+function stateForStatus(status: string): string {
+  if (status === "completed") return "GREEN";
+  if (status === "failed" || status === "needs_human") return "NEEDS_HUMAN";
+  return "PLANNED";
+}
+
 // --- Secrets view (Tauri only) ---------------------------------------------
 
 async function renderSecrets(): Promise<void> {
   view.innerHTML = "";
-  const card = h("div", { class: "card" }, [h("h2", {}, ["Secrets"])]);
-  view.append(card);
+  const page = h("section", { class: "page" });
+  page.append(
+    h("div", { class: "page-head" }, [
+      h("h1", {}, ["Secrets"]),
+      h("p", { class: "page-sub" }, [
+        "API keys stored in your OS keychain and injected into the engine as environment variables. Reference them from runner profiles via apiKeyEnv (e.g. OPENAI_API_KEY).",
+      ]),
+    ]),
+  );
+  view.append(page);
+
   if (!isTauri()) {
-    card.append(
-      h("div", { class: "hint" }, [
-        "Secure secret storage is only available in the desktop app. In a browser, provide API keys via the engine server's environment.",
+    page.append(
+      h("div", { class: "card" }, [
+        h("div", { class: "empty" }, [
+          icon(ICONS.key, "empty-ico"),
+          h("h3", {}, ["Desktop only"]),
+          h("p", {}, ["Secure secret storage is only available in the desktop app. In a browser, provide API keys via the engine server's environment."]),
+        ]),
       ]),
     );
     return;
   }
 
-  card.append(
-    h("p", { class: "hint" }, [
-      "Stored in the OS keychain and injected into the engine as environment variables. Reference them from runner profiles via apiKeyEnv (e.g. OPENAI_API_KEY).",
-    ]),
-  );
+  const card = h("div", { class: "card" });
+  page.append(card);
 
   const listEl = h("ul", { class: "secret-list" });
-  card.append(listEl);
+  card.append(h("h3", {}, ["Stored keys"]), listEl);
 
   // Stored secrets are injected into the engine only at (re)start, so changing
   // them requires a restart to take effect. Make that gate explicit rather than
@@ -472,23 +765,37 @@ async function renderSecrets(): Promise<void> {
 
   async function refresh(): Promise<void> {
     listEl.innerHTML = "";
-    const keys = await listSecretKeys();
-    if (!keys.length) listEl.append(h("li", { class: "hint" }, ["No secrets stored."]));
+    let keys: string[];
+    try {
+      keys = await listSecretKeys();
+    } catch (err) {
+      formError.textContent = `Failed to load secrets: ${(err as Error).message}`;
+      formError.hidden = false;
+      return;
+    }
+    formError.hidden = true;
+    if (!keys.length) listEl.append(h("li", { class: "hint" }, ["No secrets stored yet."]));
     for (const k of keys) {
       const del = h("button", { class: "danger small" }, ["Delete"]);
       del.addEventListener("click", async () => {
-        await deleteSecret(k);
-        await refresh();
-        markPending();
+        try {
+          await deleteSecret(k);
+          await refresh();
+          markPending();
+        } catch (err) {
+          formError.textContent = `Failed to delete ${k}: ${(err as Error).message}`;
+          formError.hidden = false;
+        }
       });
-      listEl.append(h("li", {}, [h("code", {}, [k]), del]));
+      listEl.append(h("li", {}, [icon(ICONS.key), h("code", {}, [k]), del]));
     }
   }
 
-  const form = h("form", { class: "row secret-form" });
+  const addCard = h("div", { class: "card" }, [h("h3", {}, ["Add a key"])]);
+  const form = h("form", { class: "secret-form" });
   form.innerHTML = `
-    <label>Key (env var name)<input name="key" placeholder="OPENAI_API_KEY" required /></label>
-    <label>Value<input name="value" type="password" required /></label>
+    <label class="inline-label">Key (env var name)<input name="key" placeholder="OPENAI_API_KEY" required /></label>
+    <label class="inline-label">Value<input name="value" type="password" placeholder="sk-…" required /></label>
     <button type="submit" class="primary">Save</button>
   `;
   form.addEventListener("submit", async (e) => {
@@ -515,9 +822,9 @@ async function renderSecrets(): Promise<void> {
     await refresh();
     markPending();
   });
-  card.append(form, formError);
+  addCard.append(form, formError);
 
-  const restart = h("button", {}, ["Restart engine to apply secret changes"]);
+  const restart = h("button", { class: "ghost" }, ["Restart engine to apply secret changes"]);
   // A restart re-spawns the sidecar (backend restart = shutdown + start), which
   // ABORTS any in-flight runs. Guard it: if runs are active, require an explicit
   // confirmation naming how many will be cancelled rather than silently killing
@@ -549,7 +856,7 @@ async function renderSecrets(): Promise<void> {
       `Cancel ${active} run${active === 1 ? "" : "s"} & restart`,
     ]);
     proceed.addEventListener("click", () => void performRestart());
-    const keep = h("button", {}, ["Keep runs going"]);
+    const keep = h("button", { class: "ghost" }, ["Keep runs going"]);
     keep.addEventListener("click", () => {
       confirmPanel.hidden = true;
     });
@@ -579,7 +886,9 @@ async function renderSecrets(): Promise<void> {
     }
     await performRestart();
   });
-  card.append(h("div", { class: "actions" }, [restart, pending]), confirmPanel);
+  addCard.append(h("div", { class: "actions" }, [restart, pending]), confirmPanel);
+
+  page.append(addCard);
 
   await refresh();
 }
@@ -592,7 +901,7 @@ function escapeHtml(s: string): string {
 
 async function checkEngine(): Promise<void> {
   const ok = await health();
-  engineStatus.textContent = ok ? "engine: connected" : "engine: offline";
+  engineLabel.textContent = ok ? "engine connected" : "engine offline";
   engineStatus.className = `engine-status ${ok ? "ok" : "down"}`;
 }
 
