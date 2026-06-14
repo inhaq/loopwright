@@ -38,6 +38,7 @@ export const EVENT_TYPES = {
   runnerCall: "runner_call",
   sessionFinished: "session_finished",
   integration: "integration",
+  publish: "publish",
   sessionFailed: "session_failed",
   sessionInterrupted: "session_interrupted",
 } as const;

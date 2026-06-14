@@ -11,6 +11,7 @@ import type { Rates } from "../observability/usage.js";
 import type { LoopObserver } from "../engine/loop.js";
 import { RunHub, type RunStatusData } from "./hub.js";
 import { tapStoreEvents } from "./store-tap.js";
+import { isGitRepo } from "../workspace/git.js";
 
 /**
  * The engine HTTP/SSE server (Task 25.1).
@@ -44,6 +45,13 @@ export interface StartRunBody {
   /** resume an existing session id (reuses completed tasks) */
   sessionId?: string;
   resume?: boolean;
+  /**
+   * Absolute path to a local git repository the run should build against. When
+   * set (and worktrees are enabled), tasks build in isolated worktrees off this
+   * repo and the result is integrated (and optionally pushed). Validated to be
+   * a git working tree before the run starts. Falls back to LOOPWRIGHT_REPO_DIR.
+   */
+  repoDir?: string;
 }
 
 export type RunGoalImpl = (
@@ -354,6 +362,32 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     }
     runConfig.dbPath = config.dbPath;
 
+    // Effective repo: the per-run body value wins, falling back to the env
+    // default. The body is untyped JSON, so reject a non-string up front (a
+    // number would otherwise throw on .trim() and turn a bad request into a
+    // 500). It must be an absolute path (the field is documented as such, and a
+    // relative path would resolve against the server's cwd, not the caller's),
+    // and it must be a git working tree — validate before the run so it fails
+    // with a clear 400 rather than deep inside worktree setup.
+    if (body.repoDir !== undefined && typeof body.repoDir !== "string") {
+      return send(res, 400, { error: "repoDir must be a string" }, cors);
+    }
+    const repoDir =
+      (typeof body.repoDir === "string" ? body.repoDir.trim() : "") || runConfig.repoDir.trim();
+    if (repoDir) {
+      if (!path.isAbsolute(repoDir)) {
+        return send(res, 400, { error: `repoDir must be an absolute path (got "${repoDir}")` }, cors);
+      }
+      if (!(await isGitRepo(repoDir))) {
+        return send(
+          res,
+          400,
+          { error: `repoDir "${repoDir}" is not a git repository (run git init or pick another folder)` },
+          cors,
+        );
+      }
+    }
+
     // A caller-supplied session id becomes part of git branch names and
     // worktree paths, so reject anything outside the bounded safe format before
     // it reaches the filesystem/git. New runs without an id get a safe UUID.
@@ -423,6 +457,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       observer,
       log: (line) => void hub.publish(sessionId, "log", { line }),
       signal: controller.signal,
+      ...(repoDir ? { repoDir } : {}),
     })
       .then((result) => {
         hub.publish(sessionId, "status", { phase: "done", result } satisfies RunStatusData);

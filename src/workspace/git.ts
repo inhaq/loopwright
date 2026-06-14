@@ -47,3 +47,72 @@ export async function git(exec: GitExec, args: string[], cwd: string): Promise<G
   }
   return res;
 }
+
+/**
+ * True when `dir` is inside a git working tree. Used by the server to validate
+ * a caller-selected repo folder before a run, and to fail fast with a clear
+ * message rather than deep inside worktree setup. Never throws: a missing dir,
+ * a non-repo, or git not being installed all resolve to `false`.
+ */
+export async function isGitRepo(dir: string, exec: GitExec = spawnGit): Promise<boolean> {
+  try {
+    const res = await exec(["rev-parse", "--is-inside-work-tree"], dir);
+    return res.exitCode === 0 && res.stdout.trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns the configured fetch URL for a named remote, or `undefined` when the
+ * remote does not exist. Distinguishes a genuinely-missing remote (returns
+ * `undefined`) from a real git execution failure (throws `GitError`), so the
+ * publisher doesn't misreport a broken repo / missing binary as "no remote".
+ */
+export async function remoteUrl(
+  dir: string,
+  remote: string,
+  exec: GitExec = spawnGit,
+): Promise<string | undefined> {
+  const res = await exec(["remote", "get-url", remote], dir);
+  if (res.exitCode === 0) {
+    const url = res.stdout.trim();
+    return url === "" ? undefined : url;
+  }
+  // "No such remote" is the expected not-configured signal; anything else is a
+  // real failure we must surface rather than mask as a missing remote.
+  const message = `${res.stderr}\n${res.stdout}`.toLowerCase();
+  if (message.includes("no such remote")) return undefined;
+  throw new GitError(`git remote get-url ${remote} failed (exit ${res.exitCode})`, res);
+}
+
+/** Whether the named remote is configured on the repo at `dir`. */
+export async function hasRemote(
+  dir: string,
+  remote: string,
+  exec: GitExec = spawnGit,
+): Promise<boolean> {
+  try {
+    return (await remoteUrl(dir, remote, exec)) !== undefined;
+  } catch {
+    // A predicate must stay total: an execution failure means "not usable".
+    return false;
+  }
+}
+
+/** The short subject line of the latest commit on `ref` (default HEAD). */
+export async function commitCount(
+  dir: string,
+  ref: string,
+  baseRef: string | undefined,
+  exec: GitExec = spawnGit,
+): Promise<number> {
+  try {
+    const range = baseRef ? `${baseRef}..${ref}` : ref;
+    const res = await exec(["rev-list", "--count", range], dir);
+    if (res.exitCode !== 0) return 0;
+    return Number.parseInt(res.stdout.trim(), 10) || 0;
+  } catch {
+    return 0;
+  }
+}

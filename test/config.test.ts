@@ -26,3 +26,19 @@ describe("config env boolean parsing", () => {
     expect(c.useWorktrees).toBe(true);
   });
 });
+
+describe("config git-ref validation (fail-fast)", () => {
+  it("accepts valid ref names and applies defaults", () => {
+    const c = loadConfig({ LOOPWRIGHT_BRANCH_PREFIX: "team/loopwright", LOOPWRIGHT_PR_BASE: "release/v1" });
+    expect(c.branchPrefix).toBe("team/loopwright");
+    expect(c.prBase).toBe("release/v1");
+    expect(loadConfig({}).branchPrefix).toBe("loopwright");
+  });
+
+  it("rejects a branch prefix with whitespace or invalid ref tokens", () => {
+    expect(() => loadConfig({ LOOPWRIGHT_BRANCH_PREFIX: "bad prefix" })).toThrow();
+    expect(() => loadConfig({ LOOPWRIGHT_BRANCH_PREFIX: "" })).toThrow();
+    expect(() => loadConfig({ LOOPWRIGHT_PUSH_BRANCH: "feat..x" })).toThrow();
+    expect(() => loadConfig({ LOOPWRIGHT_PR_BASE: "what?*" })).toThrow();
+  });
+});
