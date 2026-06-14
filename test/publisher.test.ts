@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp, writeFile } from "node:fs/promises";
-import { publish, publishSafety, type PrCreator } from "../src/engine/publisher.js";
+import { publish, publishSafety, redactRemoteUrl, type PrCreator } from "../src/engine/publisher.js";
 import { spawnGit } from "../src/workspace/git.js";
 import type { IntegrationResult } from "../src/engine/integrator.js";
 
@@ -53,6 +53,21 @@ describe("publishSafety", () => {
   it("refuses when tasks need a human", () => {
     const r = publishSafety({ integration: okIntegration("b"), needsHuman: ["t3"] });
     expect(r?.refusal).toBe("needs-human");
+  });
+});
+
+describe("redactRemoteUrl", () => {
+  it("strips embedded credentials from https remotes", () => {
+    expect(redactRemoteUrl("https://user:ghp_secret@github.com/o/r.git")).toBe(
+      "https://github.com/o/r.git",
+    );
+    expect(redactRemoteUrl("https://x-access-token:tok@github.com/o/r.git")).not.toContain("tok");
+  });
+
+  it("leaves credential-free and SSH remotes unchanged", () => {
+    expect(redactRemoteUrl("https://github.com/o/r.git")).toBe("https://github.com/o/r.git");
+    // SSH scp-like syntax isn't a parseable URL and carries no secret.
+    expect(redactRemoteUrl("git@github.com:o/r.git")).toBe("git@github.com:o/r.git");
   });
 });
 
@@ -187,5 +202,24 @@ describe("publish (real git, bare remote)", () => {
     expect(result.pushed).toBe(true);
     expect(result.pr?.created).toBe(false);
     expect(result.pr?.error).toContain("gh not authenticated");
+  });
+
+  it("redacts credentials from the remote URL it reports on a failed push", async () => {
+    // A credentialed HTTPS remote that cannot actually be pushed to; the push
+    // fails, but the reported remoteUrl must not leak the embedded token.
+    await spawnGit(
+      ["remote", "add", "origin", "https://user:supersecret@127.0.0.1:1/o/r.git"],
+      repo,
+    );
+    const result = await publish({
+      repoDir: repo,
+      branch: "loopwright/s/feature",
+      remote: "origin",
+      push: true,
+      integration: okIntegration("loopwright/s/feature"),
+    });
+    expect(result.pushed).toBe(false);
+    expect(result.error).toBeTruthy();
+    expect(result.remoteUrl ?? "").not.toContain("supersecret");
   });
 });

@@ -55,7 +55,7 @@ pub fn which_commands(names: Vec<String>) -> HashMap<String, bool> {
 fn is_on_path(name: &str) -> bool {
     // An explicit path (contains a separator) is checked directly.
     if name.contains('/') || name.contains('\\') {
-        return Path::new(name).is_file();
+        return is_executable(Path::new(name));
     }
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
@@ -72,10 +72,27 @@ fn is_on_path(name: &str) -> bool {
     for dir in std::env::split_paths(&paths) {
         for ext in &exts {
             let candidate = dir.join(format!("{name}{ext}"));
-            if candidate.is_file() {
+            if is_executable(&candidate) {
                 return true;
             }
         }
     }
     false
+}
+
+/// True when `path` is a regular file that is actually executable. On Unix a
+/// plain readable file on PATH is not runnable, so we check the exec bits;
+/// elsewhere (Windows) file existence plus a PATHEXT extension is sufficient.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }

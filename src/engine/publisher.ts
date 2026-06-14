@@ -160,16 +160,27 @@ export async function publish(opts: PublishOptions): Promise<PublishResult> {
   }
 
   // A push to a non-existent remote fails with an opaque git error; check first
-  // so we can return a precise, actionable message.
-  const url = await remoteUrl(opts.repoDir, remote, exec);
+  // so we can return a precise, actionable message. A real git failure (broken
+  // repo, missing binary) throws and is surfaced as an error, not "no remote".
+  let url: string | undefined;
+  try {
+    url = await remoteUrl(opts.repoDir, remote, exec);
+  } catch (err) {
+    const message = err instanceof GitError ? err.message : String((err as Error)?.message ?? err);
+    opts.log?.(`could not resolve remote "${remote}": ${message}`);
+    return { ...base, error: message };
+  }
   if (!url) {
     const reason = `Remote "${remote}" is not configured. Add it (e.g. git remote add ${remote} <url>) and try again.`;
     opts.log?.(reason);
     return { ...base, refused: "no-remote", reason };
   }
+  // Never persist credentials: HTTPS remotes can embed user:token, and this URL
+  // is recorded verbatim as a publish event (store + UI). Strip any userinfo.
+  const safeUrl = redactRemoteUrl(url);
 
   if (opts.signal?.aborted) {
-    return { ...base, remoteUrl: url, error: "cancelled before push" };
+    return { ...base, remoteUrl: safeUrl, error: "cancelled before push" };
   }
 
   try {
@@ -180,12 +191,17 @@ export async function publish(opts: PublishOptions): Promise<PublishResult> {
   } catch (err) {
     const message = err instanceof GitError ? err.message : String((err as Error)?.message ?? err);
     opts.log?.(`push failed: ${message}`);
-    return { ...base, remoteUrl: url, error: message };
+    return { ...base, remoteUrl: safeUrl, error: message };
   }
 
-  const result: PublishResult = { ...base, pushed: true, remoteUrl: url };
+  const result: PublishResult = { ...base, pushed: true, remoteUrl: safeUrl };
 
   if (opts.openPr) {
+    // If the run was cancelled after the push, don't still open a PR.
+    if (opts.signal?.aborted) {
+      result.pr = { created: false, error: "cancelled before PR creation" };
+      return result;
+    }
     const creator = opts.prCreator ?? ghPrCreator;
     const title = opts.prTitle?.trim() || `Loopwright: ${branch}`;
     const body = opts.prBody?.trim() || "Opened by Loopwright after a verified actor-critic run.";
@@ -214,6 +230,25 @@ export async function publish(opts: PublishOptions): Promise<PublishResult> {
 const GH_URL_RE = /https?:\/\/\S+/;
 
 /**
+ * Strips any embedded credentials (`user:token@`) from a remote URL so they are
+ * never written to the event store or shown in the UI. Returns the input
+ * unchanged when it isn't a parseable URL (e.g. an SSH `git@host:org/repo`
+ * form, which carries no secret).
+ */
+export function redactRemoteUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.username || parsed.password) {
+      parsed.username = "";
+      parsed.password = "";
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
  * Default PR creator: shells out to the GitHub CLI (`gh pr create`). Requires
  * `gh` to be installed and authenticated (`gh auth status`). Throws a clear
  * error if `gh` is missing or the command fails, which `publish` captures into
@@ -221,6 +256,10 @@ const GH_URL_RE = /https?:\/\/\S+/;
  */
 export const ghPrCreator: PrCreator = ({ repoDir, head, base, title, body, draft, signal }) =>
   new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("cancelled before PR creation"));
+      return;
+    }
     const args = ["pr", "create", "--head", head, "--title", title, "--body", body];
     if (base) args.push("--base", base);
     if (draft) args.push("--draft");
@@ -244,11 +283,14 @@ export const ghPrCreator: PrCreator = ({ repoDir, head, base, title, body, draft
         ),
       );
     });
-    child.on("close", (code) => {
+    child.on("close", (code, signalName) => {
       signal?.removeEventListener("abort", onAbort);
       if (code === 0) {
         const match = stdout.match(GH_URL_RE);
         resolve({ ...(match ? { url: match[0] } : {}) });
+      } else if (signal?.aborted || signalName) {
+        // Killed by our abort handler (or any signal) rather than a real failure.
+        reject(new Error("cancelled during PR creation"));
       } else {
         reject(new Error(stderr.trim() || stdout.trim() || `gh pr create exited ${code}`));
       }

@@ -42,6 +42,26 @@ function defaultDbPath(): string {
 }
 
 /**
+ * Validates a string as a safe git ref name (branch/prefix). This is the
+ * fail-fast boundary: a ref with whitespace or an invalid token would otherwise
+ * blow up much later during branch creation / push / PR, after a whole session
+ * has run. Mirrors the core rules `git check-ref-format` enforces. An empty
+ * string is allowed (callers treat it as "use the default").
+ */
+const GIT_REF_CHARS = /^[A-Za-z0-9._/-]+$/;
+function isSafeRefName(s: string): boolean {
+  if (s === "") return true; // empty => use default downstream
+  if (!GIT_REF_CHARS.test(s)) return false; // rejects spaces, ~^:?*[\ , etc.
+  if (s.includes("..") || s.includes("//")) return false;
+  if (s.startsWith("/") || s.endsWith("/")) return false;
+  if (s.startsWith(".") || s.endsWith(".")) return false;
+  if (s.endsWith(".lock")) return false;
+  return true;
+}
+const REF_NAME_MESSAGE =
+  "must be a valid git ref name (no spaces or any of ~^:?*[\\, no .. // leading/trailing . or /)";
+
+/**
  * Runner profiles supplied as a JSON array string (env-friendly), e.g.
  * `LOOPWRIGHT_RUNNERS='[{"id":"primary","kind":"cli","model":"m","options":{...}}]'`.
  * An empty/blank value means "no profiles"; anything that isn't valid JSON falls
@@ -93,7 +113,10 @@ const RawConfigSchema = z.object({
    */
   repoDir: z.string().default(""),
   /** prefix for task + integration branch names: `<prefix>/<session>/<slug>` */
-  branchPrefix: z.string().default("loopwright"),
+  branchPrefix: z
+    .string()
+    .default("loopwright")
+    .refine((s) => s !== "" && isSafeRefName(s), { message: REF_NAME_MESSAGE }),
 
   // publishing (push + PR). All opt-in and OFF by default so a run never
   // touches a remote unless the user explicitly asked for it.
@@ -104,11 +127,11 @@ const RawConfigSchema = z.object({
   /** git remote to push to */
   remote: z.string().default("origin"),
   /** override the remote branch name to push to (default: the integration branch) */
-  pushBranch: z.string().default(""),
+  pushBranch: z.string().default("").refine(isSafeRefName, { message: REF_NAME_MESSAGE }),
   /** open a pull request after pushing (requires the gh CLI or a token) */
   openPr: EnvBoolean.default(false),
   /** base branch for the pull request (default: the remote's default branch) */
-  prBase: z.string().default(""),
+  prBase: z.string().default("").refine(isSafeRefName, { message: REF_NAME_MESSAGE }),
   /** pull request title (default: derived from the goal) */
   prTitle: z.string().default(""),
   /** pull request body (default: a generated summary) */

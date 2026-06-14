@@ -65,22 +65,25 @@ export async function isGitRepo(dir: string, exec: GitExec = spawnGit): Promise<
 
 /**
  * Returns the configured fetch URL for a named remote, or `undefined` when the
- * remote does not exist. Lets the publisher give a precise "no such remote"
- * error (and surface the URL for the UI) instead of a raw push failure.
+ * remote does not exist. Distinguishes a genuinely-missing remote (returns
+ * `undefined`) from a real git execution failure (throws `GitError`), so the
+ * publisher doesn't misreport a broken repo / missing binary as "no remote".
  */
 export async function remoteUrl(
   dir: string,
   remote: string,
   exec: GitExec = spawnGit,
 ): Promise<string | undefined> {
-  try {
-    const res = await exec(["remote", "get-url", remote], dir);
-    if (res.exitCode !== 0) return undefined;
+  const res = await exec(["remote", "get-url", remote], dir);
+  if (res.exitCode === 0) {
     const url = res.stdout.trim();
     return url === "" ? undefined : url;
-  } catch {
-    return undefined;
   }
+  // "No such remote" is the expected not-configured signal; anything else is a
+  // real failure we must surface rather than mask as a missing remote.
+  const message = `${res.stderr}\n${res.stdout}`.toLowerCase();
+  if (message.includes("no such remote")) return undefined;
+  throw new GitError(`git remote get-url ${remote} failed (exit ${res.exitCode})`, res);
 }
 
 /** Whether the named remote is configured on the repo at `dir`. */
@@ -89,7 +92,12 @@ export async function hasRemote(
   remote: string,
   exec: GitExec = spawnGit,
 ): Promise<boolean> {
-  return (await remoteUrl(dir, remote, exec)) !== undefined;
+  try {
+    return (await remoteUrl(dir, remote, exec)) !== undefined;
+  } catch {
+    // A predicate must stay total: an execution failure means "not usable".
+    return false;
+  }
 }
 
 /** The short subject line of the latest commit on `ref` (default HEAD). */

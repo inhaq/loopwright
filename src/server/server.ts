@@ -363,10 +363,21 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     runConfig.dbPath = config.dbPath;
 
     // Effective repo: the per-run body value wins, falling back to the env
-    // default. When present it must be a git working tree — validate up front
-    // so the run fails with a clear 400 rather than deep inside worktree setup.
-    const repoDir = (body.repoDir ?? "").trim() || runConfig.repoDir;
+    // default. The body is untyped JSON, so reject a non-string up front (a
+    // number would otherwise throw on .trim() and turn a bad request into a
+    // 500). It must be an absolute path (the field is documented as such, and a
+    // relative path would resolve against the server's cwd, not the caller's),
+    // and it must be a git working tree — validate before the run so it fails
+    // with a clear 400 rather than deep inside worktree setup.
+    if (body.repoDir !== undefined && typeof body.repoDir !== "string") {
+      return send(res, 400, { error: "repoDir must be a string" }, cors);
+    }
+    const repoDir =
+      (typeof body.repoDir === "string" ? body.repoDir.trim() : "") || runConfig.repoDir.trim();
     if (repoDir) {
+      if (!path.isAbsolute(repoDir)) {
+        return send(res, 400, { error: `repoDir must be an absolute path (got "${repoDir}")` }, cors);
+      }
       if (!(await isGitRepo(repoDir))) {
         return send(
           res,

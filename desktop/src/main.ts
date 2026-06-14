@@ -649,6 +649,10 @@ function renderStart(): void {
     const repoDir = String(data.get("repoDir") ?? "").trim();
     const pushToRemote = Boolean(data.get("pushToRemote"));
 
+    // Revalidate now: `repoValid` reflects the last change/blur, but a user can
+    // edit or pick a path and submit before those handlers fire (stale state).
+    if (repoDir) await validateRepo();
+
     // Guard: pushing (or worktrees) requires a repo. Fail early with a clear,
     // inline message rather than a server 400.
     if (pushToRemote && !repoDir) {
