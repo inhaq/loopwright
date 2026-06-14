@@ -14,6 +14,15 @@ import {
   setSecret,
   startRun,
 } from "./api.js";
+import {
+  MODEL_CATALOG,
+  buildRunEnv,
+  findModel,
+  loadSettings,
+  modelLabel,
+  saveSettings,
+  type ModelChoice,
+} from "./settings.js";
 import type { RunMessage, SessionRecord, TraceResponse } from "./types.js";
 
 const view = document.getElementById("view") as HTMLElement;
@@ -57,6 +66,10 @@ const ICONS = {
   key: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   arrow: '<path d="M9 18l6-6-6-6"/>',
   caret: '<path d="M9 18l6-6-6-6"/>',
+  repo: '<path d="M3 3h12a2 2 0 0 1 2 2v16l-8-4-8 4V5a2 2 0 0 1 2-2z" transform="translate(2 0)"/>',
+  write: '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+  review: '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+  sliders: '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
 };
 
 /** Valid POSIX-ish environment variable name (used for secret keys). */
@@ -64,7 +77,7 @@ const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 // --- navigation -------------------------------------------------------------
 
-type Nav = "start" | "sessions" | "secrets";
+type Nav = "start" | "sessions" | "models" | "secrets";
 let teardown: (() => void) | null = null;
 
 function navigate(nav: Nav, arg?: string): void {
@@ -79,6 +92,7 @@ function navigate(nav: Nav, arg?: string): void {
   view.scrollTop = 0;
   if (nav === "start") renderStart();
   else if (nav === "sessions") renderSessions();
+  else if (nav === "models") renderModels();
   else if (nav === "secrets") renderSecrets();
   void arg;
 }
@@ -93,49 +107,6 @@ function clearNavActive(): void {
 
 // --- Start view -------------------------------------------------------------
 
-interface Preset {
-  label: string;
-  json: string;
-}
-
-const PRESETS: Record<string, Preset> = {
-  openai: {
-    label: "OpenAI (gpt-4o-mini)",
-    json: JSON.stringify(
-      [{ id: "primary", kind: "http", model: "gpt-4o-mini", options: { baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" } }],
-      null,
-      2,
-    ),
-  },
-  anthropic: {
-    label: "Anthropic (claude-3-5-sonnet)",
-    json: JSON.stringify(
-      [{ id: "primary", kind: "http", model: "claude-3-5-sonnet-latest", options: { baseUrl: "https://api.anthropic.com/v1", apiKeyEnv: "ANTHROPIC_API_KEY" } }],
-      null,
-      2,
-    ),
-  },
-  local: {
-    label: "Local (Ollama / OpenAI-compatible)",
-    json: JSON.stringify(
-      [{ id: "primary", kind: "http", model: "llama3.1", options: { baseUrl: "http://localhost:11434/v1", apiKeyEnv: "OLLAMA_API_KEY" } }],
-      null,
-      2,
-    ),
-  },
-  split: {
-    label: "Split actor + critic",
-    json: JSON.stringify(
-      [
-        { id: "builder", kind: "http", model: "gpt-4o-mini", options: { baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" } },
-        { id: "reviewer", kind: "http", model: "gpt-4o", options: { baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" } },
-      ],
-      null,
-      2,
-    ),
-  },
-};
-
 const EXAMPLE_GOALS = [
   "Add a /healthz endpoint with a test",
   "Fix the failing auth middleware tests",
@@ -144,49 +115,40 @@ const EXAMPLE_GOALS = [
 ];
 
 function renderStart(): void {
-  const page = h("section", { class: "page" });
+  const settings = loadSettings();
+  const page = h("section", { class: "page page-run" });
 
-  // Header
   page.append(
     h("div", { class: "page-head" }, [
       h("div", { class: "eyebrow" }, ["Actor – Critic loop"]),
       h("h1", {}, ["Start a new run"]),
-      h("p", { class: "page-sub" }, [
-        "Describe a goal in plain language. Loopwright plans the work, an actor agent implements it, a critic agent reviews each change, and the loop repeats until the work is verified.",
-      ]),
     ]),
   );
 
-  // How it works
-  const steps = h("div", { class: "steps" });
-  const stepData: Array<[string, string, string, string]> = [
-    ["1", ICONS.plan, "Plan", "The goal is broken into small, independently verifiable tasks."],
-    ["2", ICONS.loop, "Build & critique", "An actor writes code; a critic reviews it. They iterate until it holds up."],
-    ["3", ICONS.verify, "Verify & integrate", "Mechanical checks run, branches merge, and results are traced end to end."],
-  ];
-  for (const [n, p, title, desc] of stepData) {
-    steps.append(
-      h("div", { class: "step", "data-n": n }, [
-        icon(p, "step-ico"),
-        h("h4", {}, [title]),
-        h("p", {}, [desc]),
-      ]),
-    );
-  }
-  page.append(steps);
+  const form = h("form", { class: "card run-box" });
 
-  // Form
-  const form = h("form", { class: "card form" });
+  // -- Top row: "Goal" label on the left, selected repo on the right.
+  const repoPill = h("button", { type: "button", class: "repo-pill", title: "Change in Model settings" }, [
+    icon(ICONS.repo),
+    h("span", {}, [settings.repo.trim() || "No repository selected"]),
+  ]);
+  repoPill.classList.toggle("unset", !settings.repo.trim());
+  repoPill.addEventListener("click", () => navigate("models"));
 
-  // -- Goal field
-  const goalField = h("div", { class: "field" });
+  const topRow = h("div", { class: "run-box-top" }, [
+    h("label", { class: "label", for: "start-goal" }, ["Goal"]),
+    repoPill,
+  ]);
+
+  // -- Goal input + example chips
   const goalArea = h("textarea", {
     id: "start-goal",
     name: "goal",
-    rows: "3",
+    rows: "4",
     placeholder: "e.g. Add a /healthz endpoint that returns 200 and write a test for it",
     required: "true",
   }) as HTMLTextAreaElement;
+
   const chips = h("div", { class: "chips" });
   for (const ex of EXAMPLE_GOALS) {
     const chip = h("button", { type: "button", class: "chip" }, [ex]);
@@ -196,144 +158,27 @@ function renderStart(): void {
     });
     chips.append(chip);
   }
-  goalField.append(
-    h("label", { class: "label", for: "start-goal" }, ["Goal"]),
-    h("div", { class: "desc" }, ["What should the agents accomplish? Be specific about the outcome you expect."]),
-    goalArea,
-    chips,
-  );
 
-  // -- Model / runner field
-  const runnerField = h("div", { class: "field" });
-  const presetSelect = h("select", { id: "start-preset", name: "preset" }) as HTMLSelectElement;
-  for (const [key, p] of Object.entries(PRESETS)) {
-    presetSelect.append(h("option", { value: key }, [p.label]));
-  }
-  const runnersArea = h("textarea", { name: "runners", rows: "10", spellcheck: "false", class: "mono", "aria-label": "Runner profiles (JSON)" }) as HTMLTextAreaElement;
-  runnersArea.value = PRESETS.openai!.json;
-
-  const advanced = h("details", { class: "advanced" });
-  const summary = h("summary", {}, [icon(ICONS.caret, "caret"), "Advanced — edit runner profiles (JSON)"]);
-  advanced.append(
-    summary,
-    h("div", { class: "advanced-body" }, [
-      runnersArea,
-      h("small", { class: "desc" }, [
-        "Maps to LOOPWRIGHT_RUNNERS. API keys are referenced by env var name (apiKeyEnv) and resolved from secure storage — never pasted here.",
-      ]),
-    ]),
-  );
-
-  presetSelect.addEventListener("change", () => {
-    const p = PRESETS[presetSelect.value];
-    if (p) {
-      runnersArea.value = p.json;
-      syncRunnerIds();
-    }
-  });
-
-  runnerField.append(
-    h("label", { class: "label", for: "start-preset" }, ["Model provider"]),
-    h("div", { class: "desc" }, ["Pick a preset to get started, or open Advanced to define your own runner profiles."]),
-    presetSelect,
-    advanced,
-  );
-
-  // -- Roles
-  const rolesGrid = h("div", { class: "field-grid" });
-  const actorInput = h("input", { type: "text", name: "actor", value: "primary", list: "runner-ids" }) as HTMLInputElement;
-  const criticInput = h("input", { type: "text", name: "critic", value: "primary", list: "runner-ids" }) as HTMLInputElement;
-  const idDatalist = h("datalist", { id: "runner-ids" });
-  rolesGrid.append(
-    h("label", { class: "inline-label" }, ["Actor runner", h("span", { class: "desc" }, ["Writes the code"]), actorInput]),
-    h("label", { class: "inline-label" }, ["Critic runner", h("span", { class: "desc" }, ["Reviews the code"]), criticInput]),
-    idDatalist,
-  );
-  const rolesField = h("div", { class: "field" }, [
-    h("div", { class: "label" }, ["Roles"]),
-    h("div", { class: "desc" }, ["Which runner profile plays each role. They can be the same."]),
-    rolesGrid,
-  ]);
-
-  function syncRunnerIds(): void {
-    idDatalist.innerHTML = "";
-    try {
-      const arr = JSON.parse(runnersArea.value) as Array<{ id?: string }>;
-      const ids = arr.map((r) => r.id).filter((x): x is string => typeof x === "string");
-      for (const id of ids) idDatalist.append(h("option", { value: id }));
-      // If current actor/critic aren't valid ids, point them at the first one.
-      if (ids[0] && !ids.includes(actorInput.value)) actorInput.value = ids[0];
-      if (ids[0] && !ids.includes(criticInput.value)) criticInput.value = ids[0];
-    } catch {
-      /* invalid JSON — leave inputs as-is, validated on submit */
-    }
-  }
-  runnersArea.addEventListener("input", syncRunnerIds);
-  syncRunnerIds();
-
-  // -- Options
-  const optionsField = h("div", { class: "field" });
-  const options = h("div", { class: "options" });
-
-  function optionRow(name: string, title: string, desc: string, checked: boolean): HTMLElement {
-    const input = h("input", { type: "checkbox", name, "aria-label": title }) as HTMLInputElement;
-    if (checked) input.checked = true;
-    return h("div", { class: "option" }, [
-      h("div", { class: "option-text" }, [h("strong", {}, [title]), h("span", {}, [desc])]),
-      h("label", { class: "switch" }, [input, h("span", { class: "track" })]),
-    ]);
-  }
-
-  // Max parallel stepper
-  const parallelInput = h("input", { type: "number", name: "maxParallel", min: "1", value: "2", "aria-label": "Max parallel tasks" }) as HTMLInputElement;
-  const dec = h("button", { type: "button", "aria-label": "decrease" }, [icon("<path d='M5 12h14'/>")]);
-  const inc = h("button", { type: "button", "aria-label": "increase" }, [icon("<path d='M12 5v14'/><path d='M5 12h14'/>")]);
-  dec.addEventListener("click", () => { parallelInput.value = String(Math.max(1, Number(parallelInput.value || "1") - 1)); });
-  inc.addEventListener("click", () => { parallelInput.value = String(Number(parallelInput.value || "1") + 1); });
-  const stepper = h("div", { class: "stepper" }, [parallelInput, h("div", { class: "steps-btns" }, [inc, dec])]);
-
-  options.append(
-    h("div", { class: "option" }, [
-      h("div", { class: "option-text" }, [h("strong", {}, ["Max parallel tasks"]), h("span", {}, ["How many tasks run at the same time."])]),
-      stepper,
-    ]),
-    optionRow("worktrees", "Use git worktrees", "Isolate each task in its own worktree so parallel work never collides.", false),
-    optionRow("gate", "Mechanical gate", "Run build / test / lint checks before the critic reviews each change.", true),
-  );
-  optionsField.append(h("div", { class: "label" }, ["Options"]), options);
-
-  // -- Submit
-  const hint = h("span", { class: "hint", id: "start-hint" });
+  // -- Bottom row: run button on the left, the two models in use on the right.
   const submit = h("button", { type: "submit", class: "primary" }, [icon(ICONS.rocket), "Start run"]);
-  const actions = h("div", { class: "actions" }, [submit, hint]);
 
-  form.append(goalField, runnerField, rolesField, optionsField, actions);
+  const models = h("button", { type: "button", class: "run-models", title: "Change in Model settings" }, [
+    h("span", { class: "run-model" }, [icon(ICONS.write, "rm-ico"), h("span", { class: "rm-role" }, ["Writes"]), h("span", { class: "rm-name" }, [modelLabel(settings.writer)])]),
+    h("span", { class: "run-model" }, [icon(ICONS.review, "rm-ico"), h("span", { class: "rm-role" }, ["Reviews"]), h("span", { class: "rm-name" }, [modelLabel(settings.reviewer)])]),
+  ]);
+  models.addEventListener("click", () => navigate("models"));
+
+  const bottomRow = h("div", { class: "run-box-bottom" }, [submit, models]);
+
+  const hint = h("span", { class: "hint", id: "start-hint" });
+
+  form.append(topRow, goalArea, chips, bottomRow, hint);
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const data = new FormData(form);
-    const goal = String(data.get("goal") ?? "").trim();
+    const goal = goalArea.value.trim();
     if (!goal) {
       goalArea.focus();
-      return;
-    }
-
-    const env: Record<string, string> = {
-      LOOPWRIGHT_RUNNERS: String(data.get("runners") ?? "").trim(),
-      LOOPWRIGHT_ACTOR_RUNNER: String(data.get("actor") ?? "").trim(),
-      LOOPWRIGHT_CRITIC_RUNNER: String(data.get("critic") ?? "").trim(),
-      LOOPWRIGHT_MAX_PARALLEL: String(data.get("maxParallel") ?? "2"),
-      LOOPWRIGHT_USE_WORKTREES: data.get("worktrees") ? "true" : "false",
-      LOOPWRIGHT_MECHANICAL_GATE: data.get("gate") ? "true" : "false",
-    };
-
-    try {
-      // Validate JSON early so the user gets a clear message, not a 400.
-      if (env.LOOPWRIGHT_RUNNERS) JSON.parse(env.LOOPWRIGHT_RUNNERS);
-    } catch (err) {
-      advanced.setAttribute("open", "true");
-      hint.textContent = `Runner profiles must be valid JSON: ${(err as Error).message}`;
-      hint.className = "hint error";
       return;
     }
 
@@ -341,7 +186,7 @@ function renderStart(): void {
     hint.className = "hint";
     submit.setAttribute("disabled", "true");
     try {
-      const sessionId = await startRun({ goal, env });
+      const sessionId = await startRun({ goal, env: buildRunEnv(settings) });
       renderMonitor(sessionId, goal);
     } catch (err) {
       submit.removeAttribute("disabled");
@@ -352,6 +197,183 @@ function renderStart(): void {
 
   page.append(form);
   view.append(page);
+}
+
+// --- Model settings view ----------------------------------------------------
+
+async function renderModels(): Promise<void> {
+  const settings = loadSettings();
+  const page = h("section", { class: "page" });
+  page.append(
+    h("div", { class: "page-head" }, [
+      h("h1", {}, ["Model settings"]),
+      h("p", { class: "page-sub" }, [
+        "Choose which model writes the code and which reviews it, pick the repository to work in, and tune how runs execute. These apply to every new run.",
+      ]),
+    ]),
+  );
+  view.append(page);
+
+  // Which provider keys are stored locally (Tauri keychain). In the browser we
+  // can't see them — keys live in the engine's environment — so we don't gate.
+  let storedKeys = new Set<string>();
+  let knowKeys = false;
+  if (isTauri()) {
+    try {
+      storedKeys = new Set(await listSecretKeys());
+      knowKeys = true;
+    } catch {
+      /* fall back to "unknown" — show everything as selectable */
+    }
+  }
+
+  const persist = (): void => saveSettings(settings);
+
+  /**
+   * Builds a grouped <select> of every catalog model. Models whose API key
+   * isn't stored are still listed but flagged, so the choice is informed.
+   */
+  function modelSelect(role: "writer" | "reviewer", onChange: () => void): HTMLSelectElement {
+    const current = settings[role];
+    const select = h("select", { "aria-label": `${role} model` }) as HTMLSelectElement;
+    for (const provider of MODEL_CATALOG) {
+      const missing = knowKeys && !storedKeys.has(provider.apiKeyEnv);
+      const group = h("optgroup", { label: missing ? `${provider.label} (add ${provider.apiKeyEnv})` : provider.label }) as HTMLOptGroupElement;
+      for (const m of provider.models) {
+        const value = `${provider.id}::${m.id}`;
+        const opt = h("option", { value }, [m.label]) as HTMLOptionElement;
+        if (current.provider === provider.id && current.model === m.id) opt.selected = true;
+        group.append(opt);
+      }
+      select.append(group);
+    }
+    select.addEventListener("change", () => {
+      const [provider, model] = select.value.split("::");
+      settings[role] = { provider: provider!, model: model! } as ModelChoice;
+      persist();
+      onChange();
+    });
+    return select;
+  }
+
+  // -- Repository
+  const repoInput = h("input", {
+    type: "text",
+    value: settings.repo,
+    placeholder: "e.g. acme/web-app",
+    "aria-label": "Repository",
+  }) as HTMLInputElement;
+  repoInput.addEventListener("input", () => {
+    settings.repo = repoInput.value;
+    persist();
+  });
+  const repoCard = h("div", { class: "card" }, [
+    h("h3", {}, ["Repository"]),
+    h("div", { class: "field" }, [
+      h("div", { class: "desc" }, ["The repository this run works in. Shown on the New run box so you always know where the agents are operating."]),
+      repoInput,
+    ]),
+  ]);
+
+  // -- Models (writer + reviewer)
+  const writerNote = h("div", { class: "model-note" });
+  const reviewerNote = h("div", { class: "model-note" });
+
+  function keyHint(choice: ModelChoice): HTMLElement {
+    const found = findModel(choice);
+    const note = h("div", { class: "model-note" });
+    if (!found) return note;
+    if (knowKeys && !storedKeys.has(found.provider.apiKeyEnv)) {
+      note.classList.add("warn");
+      const link = h("button", { type: "button", class: "linklike" }, [`Add ${found.provider.apiKeyEnv}`]);
+      link.addEventListener("click", () => navigate("secrets"));
+      note.append(h("span", {}, [`No key stored for ${found.provider.label}. `]), link);
+    } else {
+      note.append(h("span", {}, [`Uses ${found.provider.apiKeyEnv} · ${found.model.id}`]));
+    }
+    return note;
+  }
+
+  const writerSelect = modelSelect("writer", () => {
+    refreshNote(writerNote, settings.writer);
+  });
+  const reviewerSelect = modelSelect("reviewer", () => {
+    refreshNote(reviewerNote, settings.reviewer);
+  });
+
+  function refreshNote(target: HTMLElement, choice: ModelChoice): void {
+    const fresh = keyHint(choice);
+    target.className = fresh.className;
+    target.innerHTML = fresh.innerHTML;
+    // Re-bind the "Add key" button if present (innerHTML drops listeners).
+    const btn = target.querySelector("button.linklike");
+    if (btn) btn.addEventListener("click", () => navigate("secrets"));
+  }
+  refreshNote(writerNote, settings.writer);
+  refreshNote(reviewerNote, settings.reviewer);
+
+  const modelsCard = h("div", { class: "card" }, [
+    h("h3", {}, ["Models"]),
+    h("div", { class: "model-grid" }, [
+      h("div", { class: "model-pick" }, [
+        h("label", { class: "model-pick-head" }, [icon(ICONS.write, "mp-ico"), "Writer", h("span", { class: "desc" }, ["Writes the code"])]),
+        writerSelect,
+        writerNote,
+      ]),
+      h("div", { class: "model-pick" }, [
+        h("label", { class: "model-pick-head" }, [icon(ICONS.review, "mp-ico"), "Reviewer", h("span", { class: "desc" }, ["Reviews the code"])]),
+        reviewerSelect,
+        reviewerNote,
+      ]),
+    ]),
+    h("div", { class: "desc keys-hint" }, [
+      isTauri()
+        ? "Models are unlocked by the API keys you store under Secrets."
+        : "Models are unlocked by the API keys provided in the engine's environment.",
+    ]),
+  ]);
+
+  // -- Run options
+  const optionsCard = h("div", { class: "card" }, [h("h3", {}, ["Run options"])]);
+  const options = h("div", { class: "options" });
+
+  const parallelInput = h("input", { type: "number", min: "1", value: String(settings.maxParallel), "aria-label": "Max parallel tasks" }) as HTMLInputElement;
+  const dec = h("button", { type: "button", "aria-label": "decrease" }, [icon("<path d='M5 12h14'/>")]);
+  const inc = h("button", { type: "button", "aria-label": "increase" }, [icon("<path d='M12 5v14'/><path d='M5 12h14'/>")]);
+  const commitParallel = (): void => {
+    settings.maxParallel = Math.max(1, Number(parallelInput.value || "1"));
+    parallelInput.value = String(settings.maxParallel);
+    persist();
+  };
+  dec.addEventListener("click", () => { parallelInput.value = String(Math.max(1, Number(parallelInput.value || "1") - 1)); commitParallel(); });
+  inc.addEventListener("click", () => { parallelInput.value = String(Number(parallelInput.value || "1") + 1); commitParallel(); });
+  parallelInput.addEventListener("change", commitParallel);
+  const stepper = h("div", { class: "stepper" }, [parallelInput, h("div", { class: "steps-btns" }, [inc, dec])]);
+
+  function optionRow(title: string, desc: string, key: "worktrees" | "mechanicalGate"): HTMLElement {
+    const input = h("input", { type: "checkbox", "aria-label": title }) as HTMLInputElement;
+    if (settings[key]) input.checked = true;
+    input.addEventListener("change", () => {
+      settings[key] = input.checked;
+      persist();
+    });
+    return h("div", { class: "option" }, [
+      h("div", { class: "option-text" }, [h("strong", {}, [title]), h("span", {}, [desc])]),
+      h("label", { class: "switch" }, [input, h("span", { class: "track" })]),
+    ]);
+  }
+
+  options.append(
+    h("div", { class: "option" }, [
+      h("div", { class: "option-text" }, [h("strong", {}, ["Max parallel tasks"]), h("span", {}, ["How many tasks run at the same time."])]),
+      stepper,
+    ]),
+    optionRow("Use git worktrees", "Isolate each task in its own worktree so parallel work never collides.", "worktrees"),
+    optionRow("Mechanical gate", "Run build / test / lint checks before the critic reviews each change.", "mechanicalGate"),
+  );
+  optionsCard.append(options);
+
+  page.append(repoCard, modelsCard, optionsCard);
 }
 
 // --- Monitor view -----------------------------------------------------------
@@ -751,6 +773,31 @@ async function renderSecrets(): Promise<void> {
   const listEl = h("ul", { class: "secret-list" });
   card.append(h("h3", {}, ["Stored keys"]), listEl);
 
+  // Models-by-key: makes it explicit which models each environment key unlocks,
+  // so the user can see exactly what a key buys them before (or after) adding it.
+  const catalogCard = h("div", { class: "card" }, [h("h3", {}, ["Models by environment key"])]);
+  const catalogList = h("div", { class: "key-catalog" });
+  catalogCard.append(catalogList);
+
+  function renderCatalog(stored: Set<string>): void {
+    catalogList.innerHTML = "";
+    for (const provider of MODEL_CATALOG) {
+      const has = stored.has(provider.apiKeyEnv);
+      const head = h("div", { class: "key-cat-head" }, [
+        icon(ICONS.key, "key-cat-ico"),
+        h("code", {}, [provider.apiKeyEnv]),
+        h("span", { class: "key-cat-prov" }, [provider.label]),
+        h("span", { class: `key-cat-status ${has ? "on" : "off"}` }, [has ? "stored" : "not stored"]),
+      ]);
+      const models = h("div", { class: "key-cat-models" });
+      for (const m of provider.models) {
+        models.append(h("span", { class: "model-tag" }, [m.label]));
+      }
+      catalogList.append(h("div", { class: `key-cat${has ? " on" : ""}` }, [head, models]));
+    }
+  }
+  page.append(catalogCard);
+
   // Stored secrets are injected into the engine only at (re)start, so changing
   // them requires a restart to take effect. Make that gate explicit rather than
   // silently leaving the running engine on stale values.
@@ -774,6 +821,7 @@ async function renderSecrets(): Promise<void> {
       return;
     }
     formError.hidden = true;
+    renderCatalog(new Set(keys));
     if (!keys.length) listEl.append(h("li", { class: "hint" }, ["No secrets stored yet."]));
     for (const k of keys) {
       const del = h("button", { class: "danger small" }, ["Delete"]);
