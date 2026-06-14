@@ -32,7 +32,8 @@ use crate::secrets;
 /// `Loopwright.app/Contents/MacOS/loopwright-engine`). Passing
 /// `"binaries/loopwright-engine"` here would resolve to a nonexistent
 /// `.../MacOS/binaries/loopwright-engine` and fail with "No such file or
-/// directory (os error 2)" at startup. See tauri-apps/tauri#3668.
+/// directory (os error 2)" at startup. See
+/// <https://github.com/tauri-apps/tauri/issues/3668>.
 const SIDECAR: &str = "loopwright-engine";
 
 /// How long to wait for the engine to announce its port before giving up.
