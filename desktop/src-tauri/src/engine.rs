@@ -21,9 +21,19 @@ use tauri_plugin_shell::ShellExt;
 
 use crate::secrets;
 
-/// Sidecar program name; must match `bundle.externalBin` in tauri.conf.json
-/// and the scoped name in capabilities/default.json.
-const SIDECAR: &str = "binaries/loopwright-engine";
+/// Sidecar program name, as the Rust shell API expects it.
+///
+/// NOTE: this is the *bare* binary name, NOT the `binaries/`-prefixed path used
+/// in `bundle.externalBin` (tauri.conf.json), the capability scope
+/// (capabilities/default.json), and the JS `Command.sidecar()` API. The Rust
+/// `app.shell().sidecar()` call resolves the program *relative to the current
+/// executable's directory* (tauri-plugin-shell `relative_command_path`), and
+/// the bundler installs the sidecar flat next to the main binary (e.g.
+/// `Loopwright.app/Contents/MacOS/loopwright-engine`). Passing
+/// `"binaries/loopwright-engine"` here would resolve to a nonexistent
+/// `.../MacOS/binaries/loopwright-engine` and fail with "No such file or
+/// directory (os error 2)" at startup. See tauri-apps/tauri#3668.
+const SIDECAR: &str = "loopwright-engine";
 
 /// How long to wait for the engine to announce its port before giving up.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
