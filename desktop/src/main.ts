@@ -761,11 +761,13 @@ async function renderModels(): Promise<void> {
       ]),
     );
   } else {
-    const hasToken = storedKeys.has("TELEGRAM_BOT_TOKEN");
-    const hasChat = storedKeys.has("TELEGRAM_CHAT_ID");
-    const tgStatus = h("div", { class: "hint" }, [
-      `Bot token: ${hasToken ? "stored" : "not set"} · Chat ID: ${hasChat ? "stored" : "not set"}`,
-    ]);
+    let hasToken = storedKeys.has("TELEGRAM_BOT_TOKEN");
+    let hasChat = storedKeys.has("TELEGRAM_CHAT_ID");
+    const tgStatus = h("div", { class: "hint" });
+    const paintTgStatus = (): void => {
+      tgStatus.textContent = `Bot token: ${hasToken ? "stored" : "not set"} · Chat ID: ${hasChat ? "stored" : "not set"}`;
+    };
+    paintTgStatus();
     const tokenInput = h("input", {
       type: "password",
       autocomplete: "off",
@@ -781,12 +783,33 @@ async function renderModels(): Promise<void> {
     const saveBtn = h("button", { type: "button", class: "primary" }, ["Save & restart engine"]);
     const removeBtn = h("button", { type: "button", class: "ghost" }, ["Remove"]);
 
+    // Re-reads the keychain index so the cached has* flags + status reflect what
+    // is actually stored after a mutation, rather than an optimistic guess.
+    const refreshTgStored = async (): Promise<void> => {
+      try {
+        const keys = new Set(await listSecretKeys());
+        hasToken = keys.has("TELEGRAM_BOT_TOKEN");
+        hasChat = keys.has("TELEGRAM_CHAT_ID");
+      } catch {
+        /* leave cached flags as-is if the index can't be read */
+      }
+      paintTgStatus();
+    };
+
     saveBtn.addEventListener("click", async () => {
       tgError.hidden = true;
       const tok = tokenInput.value.trim();
       const chat = chatInput.value.trim();
+      // Both secrets are required for the relay to work — count an already-stored
+      // value as satisfied so a user editing one field need not re-enter both.
       if (!tok && !hasToken) {
         tgError.textContent = "Enter a bot token from @BotFather.";
+        tgError.className = "hint error";
+        tgError.hidden = false;
+        return;
+      }
+      if (!chat && !hasChat) {
+        tgError.textContent = "Enter your chat id (message @userinfobot to find it).";
         tgError.className = "hint error";
         tgError.hidden = false;
         return;
@@ -802,12 +825,17 @@ async function renderModels(): Promise<void> {
       try {
         if (tok) await setSecret("TELEGRAM_BOT_TOKEN", tok);
         if (chat) await setSecret("TELEGRAM_CHAT_ID", chat);
-        await restartEngine();
-        tgError.textContent = "Saved. The relay will start polling for your messages.";
+        tokenInput.value = "";
+        chatInput.value = "";
+        const restarted = await restartEngineGuarded();
+        await refreshTgStored();
+        tgError.textContent = restarted
+          ? "Saved. The relay will start polling for your messages."
+          : "Saved — restart the engine (Secrets page) to apply.";
         tgError.className = "hint ok";
         tgError.hidden = false;
-        tgStatus.textContent = "Bot token: stored · Chat ID: stored";
       } catch (err) {
+        await refreshTgStored();
         tgError.textContent = `Failed: ${(err as Error).message}`;
         tgError.className = "hint error";
         tgError.hidden = false;
@@ -823,12 +851,15 @@ async function renderModels(): Promise<void> {
       try {
         await deleteSecret("TELEGRAM_BOT_TOKEN");
         await deleteSecret("TELEGRAM_CHAT_ID");
-        await restartEngine();
-        tgStatus.textContent = "Bot token: not set · Chat ID: not set";
-        tgError.textContent = "Telegram notifications disabled.";
+        const restarted = await restartEngineGuarded();
+        await refreshTgStored();
+        tgError.textContent = restarted
+          ? "Telegram notifications disabled."
+          : "Removed — restart the engine (Secrets page) to apply.";
         tgError.className = "hint";
         tgError.hidden = false;
       } catch (err) {
+        await refreshTgStored();
         tgError.textContent = `Failed: ${(err as Error).message}`;
         tgError.className = "hint error";
         tgError.hidden = false;
@@ -846,7 +877,7 @@ async function renderModels(): Promise<void> {
       h("div", { class: "actions" }, [saveBtn, removeBtn]),
       tgError,
       h("small", { class: "desc" }, [
-        "Saving restarts the engine to apply (this aborts any in-flight runs). The token + chat id are stored in your OS keychain.",
+        "Saving restarts the engine to apply (you'll be warned if runs are active). The token + chat id are stored in your OS keychain.",
       ]),
     );
   }
@@ -1502,6 +1533,30 @@ async function renderSecrets(): Promise<void> {
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+/**
+ * Restarts the engine, but first warns if runs are active (a restart re-spawns
+ * the sidecar and ABORTS in-flight runs). Returns true if the restart actually
+ * happened. Shared by the Secrets screen and the Telegram settings card so both
+ * use the same guard rather than silently killing runs.
+ */
+async function restartEngineGuarded(): Promise<boolean> {
+  let active = 0;
+  try {
+    active = await activeRunCount();
+  } catch {
+    /* unknown — treat as nothing to lose */
+  }
+  if (active > 0) {
+    const ok = window.confirm(
+      `${active} run${active === 1 ? " is" : "s are"} still active. ` +
+        `Restarting the engine will abort ${active === 1 ? "it" : "them"}. Continue?`,
+    );
+    if (!ok) return false;
+  }
+  await restartEngine();
+  return true;
 }
 
 async function checkEngine(): Promise<void> {

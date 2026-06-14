@@ -158,6 +158,8 @@ export interface RunSettings {
 }
 
 const STORAGE_KEY = "loopwright.runSettings.v2";
+/** Prior storage key; read once on upgrade so saved prefs aren't lost. */
+const LEGACY_STORAGE_KEY = "loopwright.runSettings.v1";
 
 export const DEFAULT_SETTINGS: RunSettings = {
   repo: "",
@@ -230,7 +232,19 @@ function coerceChoice(value: unknown, fallback: ModelChoice): ModelChoice {
 /** Loads saved settings, falling back to defaults and tolerating bad/legacy data. */
 export function loadSettings(): RunSettings {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    let raw = localStorage.getItem(STORAGE_KEY);
+    // Upgrade path: if there's no v2 payload yet, migrate the v1 one so a user's
+    // repo / publishing / run preferences survive. The provider->preset mapping
+    // happens in coerceChoice; everything else carries over by key. The migrated
+    // result is resaved under the v2 key below so this only runs once.
+    let migrating = false;
+    if (!raw) {
+      const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (legacy) {
+        raw = legacy;
+        migrating = true;
+      }
+    }
     if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<RunSettings> & Record<string, unknown>;
     const merged: RunSettings = {
@@ -262,6 +276,9 @@ export function loadSettings(): RunSettings {
     merged.advancedRunners = str(merged.advancedRunners, DEFAULT_SETTINGS.advancedRunners);
     merged.advancedActor = str(merged.advancedActor, DEFAULT_SETTINGS.advancedActor);
     merged.advancedCritic = str(merged.advancedCritic, DEFAULT_SETTINGS.advancedCritic);
+    // Persist the migrated payload under the new key so the legacy read only
+    // ever happens once.
+    if (migrating) saveSettings(merged);
     return merged;
   } catch {
     return { ...DEFAULT_SETTINGS };

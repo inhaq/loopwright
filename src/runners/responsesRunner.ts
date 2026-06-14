@@ -260,11 +260,14 @@ export class ResponsesRunner implements AgentRunner {
 
   private buildBody(req: RunRequest): Record<string, unknown> {
     const body: Record<string, unknown> = {
+      // Spread caller-supplied knobs FIRST so they can never override the core
+      // request fields (model/input) set below — otherwise a stray extraBody
+      // value could silently diverge the sent prompt/model from the request.
+      ...this.opts.extraBody,
       model: this.profile.model,
       // The Responses API takes `input` (the user turn) and a separate
       // `instructions` (the system framing), unlike Chat Completions' messages.
       input: req.prompt,
-      ...this.opts.extraBody,
     };
     if (req.system) body["instructions"] = req.system;
     if (this.opts.temperature !== undefined) body["temperature"] = this.opts.temperature;

@@ -166,8 +166,20 @@ export class TelegramRelay {
     const updates = await this.getUpdates();
     const handleNow = this.primed;
     for (const u of updates) {
+      // Acknowledge (advance the offset past) an update only AFTER it is handled
+      // successfully. If handling throws, leave it unacked and stop so Telegram
+      // re-delivers it on the next poll rather than silently dropping it.
+      if (handleNow) {
+        try {
+          await this.handleUpdate(u);
+        } catch (err) {
+          this.log(
+            `telegram: failed to handle update ${u.update_id}: ${String((err as Error)?.message ?? err)}`,
+          );
+          break;
+        }
+      }
       this.offset = u.update_id + 1;
-      if (handleNow) await this.handleUpdate(u);
     }
     this.primed = true;
   }
