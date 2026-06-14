@@ -102,12 +102,13 @@ export class RunnerActor implements Actor {
     return out.notes !== undefined ? { plan, notes: out.notes } : { plan };
   }
 
-  async build(task: TaskSpec, feedback?: BuildFeedback): Promise<ActorBuildResult> {
+  async build(task: TaskSpec, feedback?: BuildFeedback, cwd?: string): Promise<ActorBuildResult> {
     const prompt = this.prompts.build(task, feedback);
     const out = await this.runStructured(
       prompt,
       ActorBuildOutputSchema,
       `build of task "${task.id}"`,
+      cwd ?? this.cwd,
     );
     return {
       diff: out.diff,
@@ -121,10 +122,10 @@ export class RunnerActor implements Actor {
    * contract so the engine parses it identically and records the outcome as
    * UNVERIFIED_BY_CRITIC.
    */
-  async selfReview(bundle: TaskArtifactBundle): Promise<CriticRawResponse> {
+  async selfReview(bundle: TaskArtifactBundle, cwd?: string): Promise<CriticRawResponse> {
     const res = await this.runner.run({
       prompt: this.prompts.selfReview(bundle),
-      cwd: this.cwd,
+      cwd: cwd ?? this.cwd,
       system: this.prompts.system,
       ...(this.signal ? { signal: this.signal } : {}),
     });
@@ -136,10 +137,11 @@ export class RunnerActor implements Actor {
     prompt: string,
     schema: S,
     what: string,
+    cwd: string = this.cwd,
   ): Promise<z.output<S>> {
     let res = await this.runner.run({
       prompt,
-      cwd: this.cwd,
+      cwd,
       system: this.prompts.system,
       ...(this.signal ? { signal: this.signal } : {}),
     });
@@ -154,7 +156,7 @@ export class RunnerActor implements Actor {
       this.log?.(`actor ${what} output unparseable (${parsed.error}); retrying once`);
       res = await this.runner.run({
         prompt: `${prompt}\n\n${PARSE_REPAIR_NUDGE}`,
-        cwd: this.cwd,
+        cwd,
         system: this.prompts.system,
         ...(this.signal ? { signal: this.signal } : {}),
       });
@@ -193,14 +195,14 @@ export class RunnerCritic implements Critic {
    * `repairHint` the engine passes on its single retry is forwarded into the
    * prompt so the backend gets the corrective nudge.
    */
-  async review(req: CriticRequest): Promise<CriticRawResponse> {
+  async review(req: CriticRequest, cwd?: string): Promise<CriticRawResponse> {
     const prompt =
       req.kind === "plan"
         ? this.prompts.planReview(req.goal, req.plan, req.repairHint)
         : this.prompts.taskReview(req.bundle, req.repairHint);
     const res = await this.runner.run({
       prompt,
-      cwd: this.cwd,
+      cwd: cwd ?? this.cwd,
       system: this.prompts.system,
       ...(this.signal ? { signal: this.signal } : {}),
     });

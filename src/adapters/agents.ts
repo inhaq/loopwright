@@ -39,15 +39,23 @@ export interface Actor {
   /** Draft or revise the plan. `feedback` carries critic blockers on revision. */
   draftPlan(goal: string, feedback?: Finding[]): Promise<PlanDraftResult>;
 
-  /** Build the task, or fix it given feedback from a previous failed attempt. */
-  build(task: TaskSpec, feedback?: BuildFeedback): Promise<ActorBuildResult>;
+  /**
+   * Build the task, or fix it given feedback from a previous failed attempt.
+   * `cwd` is the working directory the build should operate in — the task's
+   * isolated git worktree when worktrees are enabled — so a file-editing runner
+   * edits inside that worktree rather than a shared/default directory. It is
+   * passed per call (not bound to the role) so parallel tasks in different
+   * worktrees never collide.
+   */
+  build(task: TaskSpec, feedback?: BuildFeedback, cwd?: string): Promise<ActorBuildResult>;
 
   /**
    * Degraded self-review used ONLY when the critic is unavailable (quota dry).
    * Returns raw text in the same contract the critic uses, so it parses
-   * identically -- but the result is recorded as UNVERIFIED_BY_CRITIC.
+   * identically -- but the result is recorded as UNVERIFIED_BY_CRITIC. `cwd` is
+   * the task's working directory (see {@link Actor.build}).
    */
-  selfReview(bundle: TaskArtifactBundle): Promise<CriticRawResponse>;
+  selfReview(bundle: TaskArtifactBundle, cwd?: string): Promise<CriticRawResponse>;
 }
 
 export type CriticRequest =
@@ -63,5 +71,6 @@ export interface CriticRawResponse {
 
 /** The CRITIC role: reviews the plan + each task. The scarce, gating resource. */
 export interface Critic {
-  review(req: CriticRequest): Promise<CriticRawResponse>;
+  /** Review a plan or a task. `cwd` is the task's working directory (worktree). */
+  review(req: CriticRequest, cwd?: string): Promise<CriticRawResponse>;
 }

@@ -85,6 +85,43 @@ const RawConfigSchema = z.object({
   stuckThresholdMs: z.coerce.number().int().min(1000).default(120_000),
   useWorktrees: EnvBoolean.default(true),
 
+  // repository + branch naming
+  /**
+   * Default repository directory for runs. Usually supplied per-run via the API
+   * body (`repoDir`); this env fallback lets the headless server target a repo
+   * without a UI. Empty means "no repo" (runs build in cwd without worktrees).
+   */
+  repoDir: z.string().default(""),
+  /** prefix for task + integration branch names: `<prefix>/<session>/<slug>` */
+  branchPrefix: z.string().default("loopwright"),
+
+  // publishing (push + PR). All opt-in and OFF by default so a run never
+  // touches a remote unless the user explicitly asked for it.
+  /** when false, build + integrate locally but never push (Req: dry run) */
+  dryRun: EnvBoolean.default(false),
+  /** push the integration branch to a remote after a successful integration */
+  pushToRemote: EnvBoolean.default(false),
+  /** git remote to push to */
+  remote: z.string().default("origin"),
+  /** override the remote branch name to push to (default: the integration branch) */
+  pushBranch: z.string().default(""),
+  /** open a pull request after pushing (requires the gh CLI or a token) */
+  openPr: EnvBoolean.default(false),
+  /** base branch for the pull request (default: the remote's default branch) */
+  prBase: z.string().default(""),
+  /** pull request title (default: derived from the goal) */
+  prTitle: z.string().default(""),
+  /** pull request body (default: a generated summary) */
+  prBody: z.string().default(""),
+  /** open the pull request as a draft (recommended default) */
+  prDraft: EnvBoolean.default(true),
+  /**
+   * Push even when the safety gate would refuse (failed integration, merge
+   * conflicts, failed verification, or tasks needing a human). Off by default
+   * so a broken run never reaches a remote without an explicit override.
+   */
+  pushOverrideSafety: EnvBoolean.default(false),
+
   dbPath: z.string().default(defaultDbPath()),
 });
 
@@ -108,6 +145,18 @@ export function loadConfig(
     maxParallel: env[`${ENV_PREFIX}MAX_PARALLEL`],
     stuckThresholdMs: env[`${ENV_PREFIX}STUCK_THRESHOLD_MS`],
     useWorktrees: env[`${ENV_PREFIX}USE_WORKTREES`],
+    repoDir: env[`${ENV_PREFIX}REPO_DIR`],
+    branchPrefix: env[`${ENV_PREFIX}BRANCH_PREFIX`],
+    dryRun: env[`${ENV_PREFIX}DRY_RUN`],
+    pushToRemote: env[`${ENV_PREFIX}PUSH_TO_REMOTE`],
+    remote: env[`${ENV_PREFIX}REMOTE`],
+    pushBranch: env[`${ENV_PREFIX}PUSH_BRANCH`],
+    openPr: env[`${ENV_PREFIX}OPEN_PR`],
+    prBase: env[`${ENV_PREFIX}PR_BASE`],
+    prTitle: env[`${ENV_PREFIX}PR_TITLE`],
+    prBody: env[`${ENV_PREFIX}PR_BODY`],
+    prDraft: env[`${ENV_PREFIX}PR_DRAFT`],
+    pushOverrideSafety: env[`${ENV_PREFIX}PUSH_OVERRIDE_SAFETY`],
     dbPath: env[`${ENV_PREFIX}DB_PATH`],
   });
 }

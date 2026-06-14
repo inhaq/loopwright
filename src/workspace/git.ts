@@ -47,3 +47,64 @@ export async function git(exec: GitExec, args: string[], cwd: string): Promise<G
   }
   return res;
 }
+
+/**
+ * True when `dir` is inside a git working tree. Used by the server to validate
+ * a caller-selected repo folder before a run, and to fail fast with a clear
+ * message rather than deep inside worktree setup. Never throws: a missing dir,
+ * a non-repo, or git not being installed all resolve to `false`.
+ */
+export async function isGitRepo(dir: string, exec: GitExec = spawnGit): Promise<boolean> {
+  try {
+    const res = await exec(["rev-parse", "--is-inside-work-tree"], dir);
+    return res.exitCode === 0 && res.stdout.trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns the configured fetch URL for a named remote, or `undefined` when the
+ * remote does not exist. Lets the publisher give a precise "no such remote"
+ * error (and surface the URL for the UI) instead of a raw push failure.
+ */
+export async function remoteUrl(
+  dir: string,
+  remote: string,
+  exec: GitExec = spawnGit,
+): Promise<string | undefined> {
+  try {
+    const res = await exec(["remote", "get-url", remote], dir);
+    if (res.exitCode !== 0) return undefined;
+    const url = res.stdout.trim();
+    return url === "" ? undefined : url;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether the named remote is configured on the repo at `dir`. */
+export async function hasRemote(
+  dir: string,
+  remote: string,
+  exec: GitExec = spawnGit,
+): Promise<boolean> {
+  return (await remoteUrl(dir, remote, exec)) !== undefined;
+}
+
+/** The short subject line of the latest commit on `ref` (default HEAD). */
+export async function commitCount(
+  dir: string,
+  ref: string,
+  baseRef: string | undefined,
+  exec: GitExec = spawnGit,
+): Promise<number> {
+  try {
+    const range = baseRef ? `${baseRef}..${ref}` : ref;
+    const res = await exec(["rev-list", "--count", range], dir);
+    if (res.exitCode !== 0) return 0;
+    return Number.parseInt(res.stdout.trim(), 10) || 0;
+  } catch {
+    return 0;
+  }
+}

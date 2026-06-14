@@ -10,7 +10,9 @@ import {
 } from "./engine/loop.js";
 import { runScheduledTasks, type SchedulerDeps } from "./engine/scheduler.js";
 import { integrate, type IntegrationResult } from "./engine/integrator.js";
+import { publish, type PublishResult, type PrCreator } from "./engine/publisher.js";
 import { GitWorktreeManager } from "./workspace/worktrees.js";
+import type { GitExec } from "./workspace/git.js";
 import type { IntegrationBranch } from "./engine/integrator.js";
 import type { CommandExecutor } from "./engine/mechanicalGate.js";
 import type { Store, SessionStatus } from "./storage/store.js";
@@ -56,6 +58,8 @@ export interface SessionResult {
   allVerified: boolean;
   /** present when worktrees were used: merge + full-verification result */
   integration?: IntegrationResult;
+  /** present when publishing was requested: push + PR result */
+  publish?: PublishResult;
 }
 
 export interface RunGoalOptions extends CreateRolesOptions {
@@ -81,6 +85,10 @@ export interface RunGoalOptions extends CreateRolesOptions {
   repoDir?: string;
   /** cooperative cancellation: aborts scheduling, gate commands, and the run */
   signal?: AbortSignal;
+  /** injectable git transport for worktrees/integration/publish (tests) */
+  git?: GitExec;
+  /** injectable PR creator for the publisher (defaults to the gh CLI) */
+  prCreator?: PrCreator;
 }
 
 export async function runGoal(
@@ -98,6 +106,8 @@ export async function runGoal(
     onTaskSettled,
     repoDir,
     signal,
+    git: gitExec,
+    prCreator,
     ...roleOpts
   } = opts;
   const cwd = opts.cwd ?? ".";
@@ -185,8 +195,14 @@ export async function runGoal(
     // const so its non-undefined narrowing holds inside the closures below;
     // `wtManager` mirrors it for the `finally` cleanup.
     const useWorktrees = Boolean(repoDir) && config.useWorktrees;
+    const wtSessionId = sessionId ?? randomUUID();
     const wt = useWorktrees
-      ? new GitWorktreeManager({ repoDir: repoDir as string, sessionId: sessionId ?? randomUUID() })
+      ? new GitWorktreeManager({
+          repoDir: repoDir as string,
+          sessionId: wtSessionId,
+          branchPrefix: config.branchPrefix,
+          ...(gitExec ? { git: gitExec } : {}),
+        })
       : undefined;
     wtManager = wt;
     const greenBranches: IntegrationBranch[] = [];
@@ -258,14 +274,53 @@ export async function runGoal(
             .flatMap((t) => t.verifyCommands),
         ),
       ];
+      // Named integration branch (item 12): `<prefix>/<session>/<goal-slug>`,
+      // overridable via the branch prefix. This is the branch the publisher
+      // pushes, so a meaningful name is what shows up on the remote / in a PR.
+      const integrationBranch = `${config.branchPrefix}/${slug(wtSessionId)}/${goalSlug(goal)}`;
       integration = await integrate({
         repoDir: repoDir as string,
         branches: greenBranches,
+        integrationBranch,
         ...(verifyCommands.length ? { verifyCommands } : {}),
         ...(executor ? { executor } : {}),
+        ...(gitExec ? { git: gitExec } : {}),
         ...(signal ? { signal } : {}),
         ...(opts.log ? { log: opts.log } : {}),
       });
+    }
+
+    // Publish (push + optional PR), opt-in via config and gated by the safety
+    // checks in the publisher. A dry run builds + integrates locally but never
+    // pushes (item 13). Publishing only applies to worktree runs, which produce
+    // the integration branch the publisher pushes.
+    let publishResult: PublishResult | undefined;
+    const shouldPublish =
+      Boolean(integration) && config.pushToRemote && !config.dryRun && Boolean(repoDir);
+    if (integration && shouldPublish) {
+      publishResult = await publish({
+        repoDir: repoDir as string,
+        branch: integration.integrationBranch,
+        remote: config.remote,
+        ...(config.pushBranch ? { pushBranch: config.pushBranch } : {}),
+        push: true,
+        openPr: config.openPr,
+        ...(config.prBase ? { prBase: config.prBase } : {}),
+        prTitle: config.prTitle || `Loopwright: ${goal}`,
+        ...(config.prBody ? { prBody: config.prBody } : {}),
+        prDraft: config.prDraft,
+        overrideSafety: config.pushOverrideSafety,
+        integration,
+        needsHuman,
+        ...(gitExec ? { git: gitExec } : {}),
+        ...(prCreator ? { prCreator } : {}),
+        ...(signal ? { signal } : {}),
+        ...(opts.log ? { log: opts.log } : {}),
+      });
+    } else if (integration && config.dryRun && config.pushToRemote) {
+      opts.log?.(
+        `dry run: integration branch ${integration.integrationBranch} created locally; skipping push`,
+      );
     }
 
     // Durable final status is decided LAST, so an integration that surfaced
@@ -286,6 +341,14 @@ export async function runGoal(
           },
         });
       }
+      if (publishResult) {
+        await store.recordEvent({
+          sessionId,
+          at: new Date().toISOString(),
+          type: EVENT_TYPES.publish,
+          data: publishResult as unknown as Record<string, unknown>,
+        });
+      }
       await store.updateSession(sessionId, {
         status: finalSessionStatus(needsHuman.length, integration),
       });
@@ -302,6 +365,7 @@ export async function runGoal(
       skipped,
       allVerified: green.length === plan.plan.tasks.length,
       ...(integration ? { integration } : {}),
+      ...(publishResult ? { publish: publishResult } : {}),
     };
   } catch (err) {
     // Any throw (planning, runner execution, worktree setup, integration,
@@ -350,6 +414,26 @@ export function finalSessionStatus(
   if (needsHumanCount > 0) return "needs_human";
   if (integration && !integration.ok) return "needs_human";
   return "completed";
+}
+
+/** Filesystem/branch-safe slug for an arbitrary token (e.g. a session id). */
+function slug(token: string): string {
+  return token.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+/**
+ * Turns a goal sentence into a short, branch-safe slug for the integration
+ * branch name (item 12), e.g. "Add a /healthz endpoint" -> "add-a-healthz-endpoint".
+ * Bounded so a long goal can't produce an unwieldy ref.
+ */
+function goalSlug(goal: string): string {
+  const s = goal
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 50)
+    .replace(/-+$/g, "");
+  return s || "run";
 }
 
 /**

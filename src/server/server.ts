@@ -11,6 +11,7 @@ import type { Rates } from "../observability/usage.js";
 import type { LoopObserver } from "../engine/loop.js";
 import { RunHub, type RunStatusData } from "./hub.js";
 import { tapStoreEvents } from "./store-tap.js";
+import { isGitRepo } from "../workspace/git.js";
 
 /**
  * The engine HTTP/SSE server (Task 25.1).
@@ -44,6 +45,13 @@ export interface StartRunBody {
   /** resume an existing session id (reuses completed tasks) */
   sessionId?: string;
   resume?: boolean;
+  /**
+   * Absolute path to a local git repository the run should build against. When
+   * set (and worktrees are enabled), tasks build in isolated worktrees off this
+   * repo and the result is integrated (and optionally pushed). Validated to be
+   * a git working tree before the run starts. Falls back to LOOPWRIGHT_REPO_DIR.
+   */
+  repoDir?: string;
 }
 
 export type RunGoalImpl = (
@@ -354,6 +362,21 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     }
     runConfig.dbPath = config.dbPath;
 
+    // Effective repo: the per-run body value wins, falling back to the env
+    // default. When present it must be a git working tree — validate up front
+    // so the run fails with a clear 400 rather than deep inside worktree setup.
+    const repoDir = (body.repoDir ?? "").trim() || runConfig.repoDir;
+    if (repoDir) {
+      if (!(await isGitRepo(repoDir))) {
+        return send(
+          res,
+          400,
+          { error: `repoDir "${repoDir}" is not a git repository (run git init or pick another folder)` },
+          cors,
+        );
+      }
+    }
+
     // A caller-supplied session id becomes part of git branch names and
     // worktree paths, so reject anything outside the bounded safe format before
     // it reaches the filesystem/git. New runs without an id get a safe UUID.
@@ -423,6 +446,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       observer,
       log: (line) => void hub.publish(sessionId, "log", { line }),
       signal: controller.signal,
+      ...(repoDir ? { repoDir } : {}),
     })
       .then((result) => {
         hub.publish(sessionId, "status", { phase: "done", result } satisfies RunStatusData);
