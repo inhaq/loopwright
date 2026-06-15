@@ -101,6 +101,20 @@ export async function cancelRun(sessionId: string): Promise<void> {
   if (!res.ok && res.status !== 404) throw new Error(`${res.status} ${await res.text()}`);
 }
 
+/**
+ * Injects a steering "nudge" into an in-flight run. Only runners with an inner
+ * loop (the native agent runner) are steerable; otherwise the server replies
+ * 409, surfaced here as an Error the caller can show.
+ */
+export async function nudgeRun(sessionId: string, text: string): Promise<void> {
+  const res = await fetch((await apiBase()) + `/api/runs/${encodeURIComponent(sessionId)}/nudge`, {
+    method: "POST",
+    headers: await authHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+}
+
 export async function listSessions(): Promise<SessionRecord[]> {
   const { sessions } = await getJson<{ sessions: SessionRecord[] }>("/api/sessions");
   return sessions;

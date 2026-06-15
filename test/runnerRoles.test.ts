@@ -280,4 +280,23 @@ describe("runner activity streaming (sub-step events)", () => {
     await actor.build(sampleTask, undefined, ".");
     expect(called).toBe(false);
   });
+
+  it("registers the runner's live steer handle via onSteer", async () => {
+    const steered: string[] = [];
+    const runner: AgentRunner = {
+      profile,
+      async run(req: RunRequest): Promise<RunResult> {
+        req.steering?.((text) => steered.push(text)); // runner exposes its bound steer
+        return { text: buildJson("t1") };
+      },
+    };
+    let captured: ((t: string) => void) | undefined;
+    const actor = new RunnerActor(runner, { onSteer: (s) => (captured = s) });
+
+    await actor.build(sampleTask, undefined, ".");
+
+    expect(typeof captured).toBe("function");
+    captured?.("focus on edge cases");
+    expect(steered).toEqual(["focus on edge cases"]);
+  });
 });

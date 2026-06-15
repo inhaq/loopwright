@@ -24,7 +24,7 @@
  */
 
 /** Wire format each preset maps to (matches the engine's RunnerProfile.kind). */
-export type PresetKind = "cli" | "http-responses";
+export type PresetKind = "cli" | "http-responses" | "agent";
 
 export interface RunnerPreset {
   /** stable preset id, e.g. "codex-cli" */
@@ -54,6 +54,11 @@ export interface RunnerPreset {
   command?: string;
   /** an env var the preset needs to authenticate (used for auth status) */
   requiresEnv?: string;
+  /**
+   * agent: the pi-ai provider id used to resolve the model (e.g. "anthropic").
+   * Agent presets run a real in-process tool-calling loop and edit files.
+   */
+  agentProvider?: string;
 }
 
 /**
@@ -96,6 +101,45 @@ export const PRESETS: RunnerPreset[] = [
     authHint: "Needs the kiro-cli command installed and KIRO_API_KEY stored under Secrets.",
     command: "kiro-cli",
     requiresEnv: "KIRO_API_KEY",
+  },
+  // Native agent runners: a real in-process tool-calling loop (pi agent-core +
+  // ai) that edits files directly. Grouped by the same API key as the matching
+  // HTTP provider; model ids must be ones pi-ai knows for that provider.
+  {
+    id: "anthropic-agent",
+    label: "Anthropic (agent)",
+    kind: "agent",
+    description: "Runs a native in-process agent (pi agent-core + ai) on Anthropic models and edits files directly.",
+    defaultModel: "claude-3-7-sonnet-20250219",
+    configurableModel: true,
+    editsFiles: true,
+    authHint: "Needs ANTHROPIC_API_KEY stored under Secrets.",
+    apiKeyEnv: "ANTHROPIC_API_KEY",
+    agentProvider: "anthropic",
+  },
+  {
+    id: "openai-agent",
+    label: "OpenAI (agent)",
+    kind: "agent",
+    description: "Runs a native in-process agent (pi agent-core + ai) on OpenAI models and edits files directly.",
+    defaultModel: "gpt-4.1",
+    configurableModel: true,
+    editsFiles: true,
+    authHint: "Needs OPENAI_API_KEY stored under Secrets.",
+    apiKeyEnv: "OPENAI_API_KEY",
+    agentProvider: "openai",
+  },
+  {
+    id: "google-agent",
+    label: "Google (agent)",
+    kind: "agent",
+    description: "Runs a native in-process agent (pi agent-core + ai) on Google Gemini models and edits files directly.",
+    defaultModel: "gemini-2.5-pro",
+    configurableModel: true,
+    editsFiles: true,
+    authHint: "Needs GEMINI_API_KEY stored under Secrets.",
+    apiKeyEnv: "GEMINI_API_KEY",
+    agentProvider: "google",
   },
 ];
 
@@ -296,13 +340,28 @@ export function saveSettings(settings: RunSettings): void {
 /** A runner profile as accepted by LOOPWRIGHT_RUNNERS. */
 interface RunnerProfile {
   id: string;
-  kind: "cli" | "http-responses";
+  kind: "cli" | "http-responses" | "agent";
   model: string;
   options: Record<string, unknown>;
 }
 
 function profileFor(settings: RunSettings, id: string, choice: ModelChoice): RunnerProfile {
   const preset = getPreset(choice.preset) ?? getPreset(DEFAULT_SETTINGS.writer.preset)!;
+
+  // Native in-process agent: a real tool-calling loop that edits files. The
+  // engine resolves the model via the pi-ai provider id; the API key env is
+  // forwarded so the runner can authenticate.
+  if (preset.kind === "agent") {
+    return {
+      id,
+      kind: "agent",
+      model: effectiveModel(choice),
+      options: {
+        provider: preset.agentProvider ?? preset.id,
+        ...(preset.apiKeyEnv ? { apiKeyEnv: preset.apiKeyEnv } : {}),
+      },
+    };
+  }
 
   if (preset.id === "kiro-cli") {
     const trust = settings.kiroTrustTools.trim();

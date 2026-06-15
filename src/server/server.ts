@@ -254,6 +254,13 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   let lastRun: { env: Record<string, string>; repoDir?: string } | undefined;
   /** abort controllers for in-flight runs, keyed by session id (for cancel) */
   const controllers = new Map<string, AbortController>();
+  /**
+   * Live steer handle for each in-flight run, keyed by session id. Updated each
+   * time a runner call (with an inner loop) starts; POST /api/runs/:id/nudge
+   * invokes it to inject guidance into the running agent. Latest-wins, so a
+   * nudge targets whatever runner call is currently active.
+   */
+  const steerers = new Map<string, (text: string) => void>();
   /** open SSE responses, so a graceful shutdown can end them deterministically */
   const sseClients = new Set<ServerResponse>();
   /**
@@ -335,6 +342,34 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       if (!controller) return send(res, 404, { error: `no active run for session "${id}"` }, cors);
       controller.abort();
       return send(res, 202, { cancelling: true }, cors);
+    }
+
+    // Steer (nudge) an in-flight run: inject a user message into the currently
+    // active agent runner call, taking effect after its current turn. Only
+    // runners with an inner loop (the native agent runner) register a steer
+    // handle; for others this reports that there's nothing steerable.
+    const nudgeMatch = pathname.match(/^\/api\/runs\/([^/]+)\/nudge$/);
+    if (nudgeMatch && method === "POST") {
+      const id = decodeURIComponent(nudgeMatch[1] as string);
+      let nudgeBody: { text?: unknown };
+      try {
+        nudgeBody = ((await readJsonBody(req)) ?? {}) as { text?: unknown };
+      } catch (err) {
+        return send(res, 400, { error: `invalid JSON body: ${String((err as Error).message)}` }, cors);
+      }
+      const text = typeof nudgeBody.text === "string" ? nudgeBody.text.trim() : "";
+      if (!text) return send(res, 400, { error: "text is required" }, cors);
+      const steer = steerers.get(id);
+      if (!steer) {
+        return send(
+          res,
+          409,
+          { error: `no steerable runner active for session "${id}" (the active backend may not support steering)` },
+          cors,
+        );
+      }
+      steer(text);
+      return send(res, 202, { nudged: true }, cors);
     }
 
     // Graceful shutdown: the desktop shell calls this before killing the
@@ -485,6 +520,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     const settle = (): void => {
       activeRuns = Math.max(0, activeRuns - 1);
       controllers.delete(sessionId);
+      steerers.delete(sessionId);
       const timer = setTimeout(() => hub.forget(sessionId, generation), retainMs);
       if (typeof timer.unref === "function") timer.unref();
     };
@@ -501,6 +537,7 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       observer,
       log: (line) => void hub.publish(sessionId, "log", { line }),
       signal: controller.signal,
+      onSteer: (steer) => steerers.set(sessionId, steer),
       ...(repoDir ? { repoDir } : {}),
     })
       .then((result) => {

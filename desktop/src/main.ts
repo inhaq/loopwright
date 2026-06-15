@@ -11,6 +11,7 @@ import {
   isTauri,
   listSecretKeys,
   listSessions,
+  nudgeRun,
   openStream,
   pickDirectory,
   restartEngine,
@@ -372,7 +373,7 @@ async function renderModels(): Promise<void> {
   }
   /** Whether a preset's required API key is known-missing. */
   function keyMissing(p: RunnerPreset): boolean {
-    const env = p.kind === "http-responses" ? p.apiKeyEnv : p.requiresEnv;
+    const env = p.kind === "cli" ? p.requiresEnv : p.apiKeyEnv;
     return env !== undefined && knowKeys && !storedKeys.has(env);
   }
   function presetMissing(p: RunnerPreset): boolean {
@@ -380,7 +381,7 @@ async function renderModels(): Promise<void> {
   }
   function presetMissingLabel(p: RunnerPreset): string {
     if (commandMissing(p)) return `install ${p.command}`;
-    const env = p.kind === "http-responses" ? p.apiKeyEnv : p.requiresEnv;
+    const env = p.kind === "cli" ? p.requiresEnv : p.apiKeyEnv;
     return `add ${env}`;
   }
 
@@ -442,7 +443,7 @@ async function renderModels(): Promise<void> {
     if (!preset) return note;
 
     if (keyMissing(preset)) {
-      const env = preset.kind === "http-responses" ? preset.apiKeyEnv : preset.requiresEnv;
+      const env = preset.kind === "cli" ? preset.requiresEnv : preset.apiKeyEnv;
       note.className = "model-note warn";
       const link = h("button", { type: "button", class: "linklike" }, [`Add ${env}`]);
       link.addEventListener("click", () => navigate("secrets"));
@@ -460,7 +461,7 @@ async function renderModels(): Promise<void> {
         note.append(h("span", {}, [`${preset.authHint} Edits files directly — runs can produce real, committable changes.`]));
       } else {
         note.className = "model-note warn";
-        note.append(h("span", {}, ["Returns a diff but doesn't edit files. Pick a CLI writer (Codex CLI / Kiro CLI) to change a repo."]));
+        note.append(h("span", {}, ["Returns a diff but doesn't edit files. Pick a CLI or agent writer (Codex CLI / Kiro CLI / a native agent) to change a repo."]));
       }
       return note;
     }
@@ -897,10 +898,20 @@ function renderMonitor(sessionId: string, goal: string): void {
   const phase = h("div", { class: "phase running", id: "phase" }, ["running…"]);
   const plan = h("div", { class: "plan", id: "plan" });
   const stopBtn = h("button", { class: "danger small" }, ["Stop run"]);
+  // Steering: nudge an in-flight agent run with extra guidance. Only effective
+  // for steerable backends (the native agent runner); other backends reply 409.
+  const nudgeInput = h("input", {
+    type: "text",
+    class: "nudge-input",
+    placeholder: "Nudge the agent…",
+    "aria-label": "Nudge the in-flight run",
+  }) as HTMLInputElement;
+  const nudgeBtn = h("button", { class: "small" }, ["Nudge"]);
 
   const header = h("div", { class: "card run-head" }, [
     h("div", { class: "goal" }, [goal]),
     h("div", { class: "meta-row" }, [phase, stopBtn, h("span", { class: "session-id" }, [`session ${sessionId}`])]),
+    h("div", { class: "meta-row nudge-row" }, [nudgeInput, nudgeBtn]),
     plan,
   ]);
 
@@ -914,6 +925,35 @@ function renderMonitor(sessionId: string, goal: string): void {
       stopBtn.removeAttribute("disabled");
       stopBtn.textContent = "Stop run";
       plan.textContent = `Cancel failed: ${(err as Error).message}`;
+    }
+  });
+
+  // Nudge control: inject steering guidance into the running agent.
+  let nudging = false;
+  const sendNudge = async (): Promise<void> => {
+    if (nudging) return;
+    const text = nudgeInput.value.trim();
+    if (!text) return;
+    nudging = true;
+    nudgeBtn.setAttribute("disabled", "true");
+    nudgeInput.setAttribute("disabled", "true");
+    try {
+      await nudgeRun(sessionId, text);
+      nudgeInput.value = "";
+      appendLog(`    · you → nudge: ${text}`);
+    } catch (err) {
+      plan.textContent = `Nudge failed: ${(err as Error).message}`;
+    } finally {
+      nudging = false;
+      nudgeBtn.removeAttribute("disabled");
+      nudgeInput.removeAttribute("disabled");
+    }
+  };
+  nudgeBtn.addEventListener("click", () => void sendNudge());
+  nudgeInput.addEventListener("keydown", (ev) => {
+    if ((ev as KeyboardEvent).key === "Enter") {
+      ev.preventDefault();
+      void sendNudge();
     }
   });
 
@@ -983,6 +1023,14 @@ function renderMonitor(sessionId: string, goal: string): void {
       } else if (ev.type === "plan_reviewed") {
         (document.getElementById("plan") as HTMLElement).textContent =
           `Plan: approved=${ev.data.approved} · revisions=${ev.data.revisions} · open items=${ev.data.openItems}`;
+      } else if (ev.type === "runner_activity") {
+        // Live sub-step feed from an agent runner's inner loop (tool calls).
+        const d = ev.data ?? {};
+        if (d.phase === "tool_start") {
+          appendLog(`    · ${d.role} → ${d.toolName}`);
+        } else if (d.phase === "tool_end") {
+          appendLog(`    · ${d.role} ✓ ${d.toolName}${d.isError ? " (error)" : ""}`);
+        }
       }
     } else if (msg.type === "status") {
       const phaseEl = document.getElementById("phase") as HTMLElement;

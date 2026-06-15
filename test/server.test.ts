@@ -241,6 +241,96 @@ describe("server: run cancellation", () => {
   });
 });
 
+describe("server: steering (nudge)", () => {
+  /** Builds a run that registers a steer handle (optionally) and stays active
+   *  until its AbortSignal fires, so the test can nudge it mid-flight. */
+  function pendingRun(opts: { registersSteer: boolean }): RunGoalImpl {
+    return (_g, _c, o = {}) =>
+      new Promise((_resolve, reject) => {
+        if (opts.registersSteer) o.onSteer?.((text) => nudges.push(text));
+        o.signal?.addEventListener("abort", () => {
+          const e = new Error("run cancelled");
+          e.name = "AbortError";
+          reject(e);
+        });
+      });
+  }
+  let nudges: string[];
+  beforeEach(() => {
+    nudges = [];
+  });
+
+  it("injects a nudge into a steerable in-flight run", async () => {
+    await server?.stop();
+    server = createServer({
+      store: new MemoryStore(),
+      config: baseConfig,
+      baseEnv: {},
+      token: TOKEN,
+      runGoalImpl: pendingRun({ registersSteer: true }),
+    });
+    base = `http://127.0.0.1:${await server.start(0)}`;
+
+    const id = await startRun("long task");
+    const res = await fetch(`${base}/api/runs/${id}/nudge`, {
+      method: "POST",
+      headers: auth({ "content-type": "application/json" }),
+      body: JSON.stringify({ text: "focus on the failing test" }),
+    });
+    expect(res.status).toBe(202);
+    expect(nudges).toEqual(["focus on the failing test"]);
+  });
+
+  it("rejects a nudge with no text (400) and an unknown/non-steerable run (409/404)", async () => {
+    await server?.stop();
+    server = createServer({
+      store: new MemoryStore(),
+      config: baseConfig,
+      baseEnv: {},
+      token: TOKEN,
+      runGoalImpl: pendingRun({ registersSteer: false }),
+    });
+    base = `http://127.0.0.1:${await server.start(0)}`;
+
+    const id = await startRun("long task");
+
+    // No text -> 400.
+    const noText = await fetch(`${base}/api/runs/${id}/nudge`, {
+      method: "POST",
+      headers: auth({ "content-type": "application/json" }),
+      body: JSON.stringify({ text: "   " }),
+    });
+    expect(noText.status).toBe(400);
+
+    // Active run that didn't register a steer handle -> 409.
+    const notSteerable = await fetch(`${base}/api/runs/${id}/nudge`, {
+      method: "POST",
+      headers: auth({ "content-type": "application/json" }),
+      body: JSON.stringify({ text: "hi" }),
+    });
+    expect(notSteerable.status).toBe(409);
+
+    // Unknown session -> 409 (no steerer registered for it).
+    const ghost = await fetch(`${base}/api/runs/ghost/nudge`, {
+      method: "POST",
+      headers: auth({ "content-type": "application/json" }),
+      body: JSON.stringify({ text: "hi" }),
+    });
+    expect(ghost.status).toBe(409);
+  });
+
+  it("requires the auth token", async () => {
+    await startServer(pendingRun({ registersSteer: true }));
+    const id = await startRun("t");
+    const res = await fetch(`${base}/api/runs/${id}/nudge`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "hi" }),
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
 describe("server: admission control", () => {
   it("rejects new runs past the active cap with 429", async () => {
     let release: () => void = () => {};
