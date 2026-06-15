@@ -25,6 +25,7 @@ import { loadConfig } from "../config.js";
 import { openStore } from "../storage/store.js";
 import { reconcileInterruptedSessions } from "../session.js";
 import { createServer, isLoopbackHost } from "./server.js";
+import { createTelegramRelayFromEnv } from "../notify/telegram.js";
 
 function envFlag(v: string | undefined): boolean {
   return v !== undefined && ["1", "true", "yes", "on"].includes(v.trim().toLowerCase());
@@ -49,14 +50,28 @@ async function main(): Promise<void> {
   // The supervising process (Tauri) may pin the token via env; otherwise a
   // fresh random one is generated and reported on the readiness line.
   const token = process.env.LOOPWRIGHT_TOKEN || randomUUID();
+
+  // Optional phone updates: a Telegram relay that pushes final run status and
+  // accepts replies (as new goals) over OUTBOUND long-polling only — no inbound
+  // port, so the engine stays loopback-only. Absent config => no relay.
+  const relay = createTelegramRelayFromEnv(process.env, (line) => console.error(line));
+
   const server = createServer({
     store,
     config,
     token,
     // When a graceful shutdown finishes (signal or POST /api/shutdown), exit.
     onShutdown: () => process.exit(0),
+    ...(relay ? { notifier: relay } : {}),
     ...(staticDir ? { staticDir } : {}),
   });
+
+  // The relay needs to launch chat-initiated runs through the same validated
+  // path the UI uses; hand it the server once both exist.
+  if (relay) {
+    relay.attach(server);
+    relay.start();
+  }
 
   const port = Number.parseInt(process.env.LOOPWRIGHT_PORT ?? "0", 10) || 0;
   const host = process.env.LOOPWRIGHT_HOST ?? "127.0.0.1";
@@ -85,6 +100,7 @@ async function main(): Promise<void> {
   const shutdown = (): void => {
     if (stopping) return;
     stopping = true;
+    relay?.stop();
     void server.stop().then(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
