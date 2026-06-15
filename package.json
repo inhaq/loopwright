@@ -18,6 +18,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.79.3",
+    "@earendil-works/pi-ai": "^0.79.3",
     "zod": "^3.23.8"
   },
   "devDependencies": {

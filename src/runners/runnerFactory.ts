@@ -3,6 +3,7 @@ import { CliRunner } from "./cliRunner.js";
 import { HttpRunner } from "./httpRunner.js";
 import { ResponsesRunner } from "./responsesRunner.js";
 import { MockRunner } from "./mockRunner.js";
+import { PiAgentRunner } from "./piAgentRunner.js";
 
 /**
  * Constructs an AgentRunner from a profile, dispatching purely on the profile's
@@ -33,6 +34,8 @@ export const createRunner: RunnerFactory = (profile) => {
       return new HttpRunner(profile);
     case "http-responses":
       return new ResponsesRunner(profile);
+    case "agent":
+      return new PiAgentRunner(profile);
     default: {
       // Exhaustiveness guard: a new RunnerKind must be handled above.
       const exhaustive: never = profile.kind;

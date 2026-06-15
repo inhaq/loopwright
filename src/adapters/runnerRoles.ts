@@ -3,8 +3,9 @@ import { PlanSchema } from "../schemas/plan.js";
 import type { TaskSpec } from "../schemas/plan.js";
 import type { Finding } from "../schemas/critic.js";
 import type { TaskArtifactBundle } from "../schemas/artifact.js";
-import type { AgentRunner } from "../runners/agentRunner.js";
+import type { AgentRunner, RunnerActivity } from "../runners/agentRunner.js";
 import { parseLastValidJson, type JsonParseResult } from "../engine/jsonExtract.js";
+import type { RoleName, RunnerActivityEvent } from "../observability/events.js";
 import type {
   Actor,
   ActorBuildResult,
@@ -66,6 +67,8 @@ export interface RunnerActorOptions {
   log?: (line: string) => void;
   /** cooperative cancellation, threaded into every runner call */
   signal?: AbortSignal;
+  /** sink for mid-call runner activity (sub-step streaming), if any */
+  onActivity?: (e: RunnerActivityEvent) => void;
 }
 
 export interface RunnerCriticOptions {
@@ -74,6 +77,34 @@ export interface RunnerCriticOptions {
   log?: (line: string) => void;
   /** cooperative cancellation, threaded into every runner call */
   signal?: AbortSignal;
+  /** sink for mid-call runner activity (sub-step streaming), if any */
+  onActivity?: (e: RunnerActivityEvent) => void;
+}
+
+/**
+ * Builds the per-call `onEvent` sink that enriches a runner's vendor-neutral
+ * {@link RunnerActivity} with the role + runner identity before forwarding it
+ * to the role's activity sink. Returns undefined when no sink is configured, so
+ * runners that stream skip the work entirely.
+ */
+function activityForwarder(
+  runner: AgentRunner,
+  role: RoleName,
+  onActivity: ((e: RunnerActivityEvent) => void) | undefined,
+): ((a: RunnerActivity) => void) | undefined {
+  if (!onActivity) return undefined;
+  return (a: RunnerActivity) =>
+    onActivity({
+      role,
+      runnerId: runner.profile.id,
+      model: runner.profile.model,
+      phase: a.phase,
+      ...(a.toolName !== undefined ? { toolName: a.toolName } : {}),
+      ...(a.toolCallId !== undefined ? { toolCallId: a.toolCallId } : {}),
+      ...(a.isError !== undefined ? { isError: a.isError } : {}),
+      ...(a.turn !== undefined ? { turn: a.turn } : {}),
+      at: a.at,
+    });
 }
 
 /** Actor role backed by an AgentRunner + prompt templates. */
@@ -84,6 +115,8 @@ export class RunnerActor implements Actor {
   private readonly repairOnce: boolean;
   private readonly log: ((line: string) => void) | undefined;
   private readonly signal: AbortSignal | undefined;
+  /** per-call activity sink, enriched with role identity (undefined = off) */
+  private readonly onEvent: ((a: RunnerActivity) => void) | undefined;
 
   constructor(runner: AgentRunner, opts: RunnerActorOptions = {}) {
     this.runner = runner;
@@ -92,6 +125,7 @@ export class RunnerActor implements Actor {
     this.repairOnce = opts.repairOnce ?? true;
     this.log = opts.log;
     this.signal = opts.signal;
+    this.onEvent = activityForwarder(runner, "actor", opts.onActivity);
   }
 
   async draftPlan(goal: string, feedback?: Finding[]): Promise<PlanDraftResult> {
@@ -128,6 +162,7 @@ export class RunnerActor implements Actor {
       cwd: cwd ?? this.cwd,
       system: this.prompts.system,
       ...(this.signal ? { signal: this.signal } : {}),
+      ...(this.onEvent ? { onEvent: this.onEvent } : {}),
     });
     return { text: res.text, quotaExhausted: res.quotaExhausted };
   }
@@ -144,6 +179,7 @@ export class RunnerActor implements Actor {
       cwd,
       system: this.prompts.system,
       ...(this.signal ? { signal: this.signal } : {}),
+      ...(this.onEvent ? { onEvent: this.onEvent } : {}),
     });
     if (res.quotaExhausted) {
       throw new RunnerRoleError(`Actor ${what} failed: runner quota exhausted.`, {
@@ -159,6 +195,7 @@ export class RunnerActor implements Actor {
         cwd,
         system: this.prompts.system,
         ...(this.signal ? { signal: this.signal } : {}),
+        ...(this.onEvent ? { onEvent: this.onEvent } : {}),
       });
       if (res.quotaExhausted) {
         throw new RunnerRoleError(`Actor ${what} failed: runner quota exhausted.`, {
@@ -181,12 +218,15 @@ export class RunnerCritic implements Critic {
   private readonly prompts: CriticPromptTemplates;
   private readonly cwd: string;
   private readonly signal: AbortSignal | undefined;
+  /** per-call activity sink, enriched with role identity (undefined = off) */
+  private readonly onEvent: ((a: RunnerActivity) => void) | undefined;
 
   constructor(runner: AgentRunner, opts: RunnerCriticOptions = {}) {
     this.runner = runner;
     this.prompts = opts.prompts ?? DEFAULT_CRITIC_PROMPTS;
     this.cwd = opts.cwd ?? ".";
     this.signal = opts.signal;
+    this.onEvent = activityForwarder(runner, "critic", opts.onActivity);
   }
 
   /**
@@ -205,6 +245,7 @@ export class RunnerCritic implements Critic {
       cwd: cwd ?? this.cwd,
       system: this.prompts.system,
       ...(this.signal ? { signal: this.signal } : {}),
+      ...(this.onEvent ? { onEvent: this.onEvent } : {}),
     });
     return { text: res.text, quotaExhausted: res.quotaExhausted };
   }
