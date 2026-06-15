@@ -178,3 +178,64 @@ describe("fallback self-review", () => {
     expect(out.nits).toHaveLength(1); // the blocker was filtered out
   });
 });
+
+
+describe("ground-truth diff capture (captureDiff)", () => {
+  /** A critic that records the diff it was asked to review, then passes green. */
+  class RecordingCritic extends MockCritic {
+    seenDiff: string | undefined;
+    constructor() {
+      super({ fallback: criticGreen() });
+    }
+    override async review(req: Parameters<MockCritic["review"]>[0]) {
+      if (req.kind === "task") this.seenDiff = req.bundle.diff;
+      return super.review(req);
+    }
+  }
+
+  it("reviews the captured worktree diff instead of the model's self-reported diff", async () => {
+    const t = task();
+    const actor = new MockActor({ plans: [onePlan(t)] }); // synthetic model diff
+    const critic = new RecordingCritic();
+
+    const out = await runTask(t, {
+      ...makeDeps({ actor, critic }),
+      captureDiff: () => "REAL WORKTREE DIFF\n+added line",
+    });
+
+    expect(out.finalState).toBe("GREEN");
+    expect(out.lastDiff).toBe("REAL WORKTREE DIFF\n+added line");
+    expect(critic.seenDiff).toContain("REAL WORKTREE DIFF"); // redaction keeps body
+    expect(critic.seenDiff).not.toContain("attempt 0"); // not the model's diff
+  });
+
+  it("falls back to the model diff when capture returns empty (e.g. non-editing runner)", async () => {
+    const t = task();
+    const actor = new MockActor({ plans: [onePlan(t)] });
+    const critic = new MockCritic({ fallback: criticGreen() });
+
+    const out = await runTask(t, {
+      ...makeDeps({ actor, critic }),
+      captureDiff: () => "   ", // whitespace-only => treated as no diff
+    });
+
+    expect(out.finalState).toBe("GREEN");
+    expect(out.lastDiff).toContain(`src/${t.id}.ts`); // the model's synthetic diff
+  });
+
+  it("falls back to the model diff when capture throws", async () => {
+    const t = task();
+    const actor = new MockActor({ plans: [onePlan(t)] });
+    const critic = new MockCritic({ fallback: criticGreen() });
+
+    const out = await runTask(t, {
+      ...makeDeps({ actor, critic }),
+      captureDiff: () => {
+        throw new Error("git exploded");
+      },
+    });
+
+    expect(out.finalState).toBe("GREEN");
+    expect(out.lastDiff).toContain(`src/${t.id}.ts`);
+  });
+});

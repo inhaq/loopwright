@@ -40,6 +40,43 @@ describe("redaction", () => {
     expect(out).toContain("END");
     expect(out).toContain("truncated");
   });
+
+  it("truncates multi-line output on line boundaries, reporting omitted lines", () => {
+    const lines = Array.from({ length: 300 }, (_, i) => `line-${i}: ${"y".repeat(40)}`);
+    const out = redactAndTruncate(lines.join("\n"), 600);
+
+    expect(out).toContain("line-0:"); // first line kept
+    expect(out).toContain("line-299:"); // last line kept
+    expect(out).toContain("lines truncated");
+    expect(out).not.toContain("line-150:"); // a middle line dropped
+
+    // Every retained line in the head/tail segments is complete (no mid-line cut).
+    const segments = out.split(/\n\.\.\.\[[^\]]*\]\.\.\.\n/);
+    expect(segments).toHaveLength(2);
+    for (const seg of segments) {
+      for (const ln of seg.split("\n").filter(Boolean)) {
+        expect(ln).toMatch(/^line-\d+: y{40}$/);
+      }
+    }
+  });
+
+  it("falls back to a hard char slice for a single very long line", () => {
+    const big = "START" + "x".repeat(5_000) + "END";
+    const out = redactAndTruncate(big, 500);
+    expect(out).toContain("START");
+    expect(out).toContain("END");
+    expect(out).toContain("truncated");
+    expect(out.length).toBeLessThan(1_000);
+  });
+
+  it("still redacts secrets in the retained head/tail after truncation", () => {
+    const text =
+      "OPENAI_API_KEY=sk-abcdef0123456789abcdef\n" + "log line\n".repeat(2_000) + "trailing FOO=bar";
+    const out = redactAndTruncate(text, 400);
+    expect(out).toContain("OPENAI_API_KEY=[REDACTED]");
+    expect(out).not.toContain("sk-abcdef");
+    expect(out).toContain("trailing FOO=bar");
+  });
 });
 
 

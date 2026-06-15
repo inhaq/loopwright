@@ -18,15 +18,15 @@ import {
   startRun,
 } from "./api.js";
 import {
-  MODEL_CATALOG,
+  PRESETS,
   buildRunEnv,
-  editsFiles,
-  findModel,
+  getPreset,
   loadSettings,
   modelLabel,
   saveSettings,
   usesAdvancedRunners,
   type ModelChoice,
+  type RunnerPreset,
 } from "./settings.js";
 import type { RunMessage, SessionRecord, TraceResponse } from "./types.js";
 
@@ -346,9 +346,9 @@ async function renderModels(): Promise<void> {
   );
   view.append(page);
 
-  // Availability: HTTP providers are unlocked by a stored API key (Tauri
-  // keychain); CLI agents by an installed command. In a browser we can't see
-  // either, so nothing is gated there.
+  // Availability: Responses presets are unlocked by a stored API key (Tauri
+  // keychain); CLI presets by an installed command (and, for Kiro, a key too).
+  // In a browser we can't see either, so nothing is gated there.
   let storedKeys = new Set<string>();
   let knowKeys = false;
   let installed: Record<string, boolean> = {};
@@ -360,70 +360,111 @@ async function renderModels(): Promise<void> {
       /* unknown — show everything as selectable */
     }
     try {
-      installed = await detectCommands(["codex", "kiro", "gh"]);
+      installed = await detectCommands(["codex", "kiro-cli", "gh"]);
     } catch {
-      /* unknown — don't flag CLI agents as missing */
+      /* unknown — don't flag CLI presets as missing */
     }
   }
 
-  function providerMissing(p: (typeof MODEL_CATALOG)[number]): boolean {
-    if (p.kind === "cli") return isTauri() && installed[p.command ?? ""] !== true;
-    return knowKeys && !storedKeys.has(p.apiKeyEnv ?? "");
+  /** Whether a preset's command is known-missing (desktop only). */
+  function commandMissing(p: RunnerPreset): boolean {
+    return p.kind === "cli" && isTauri() && installed[p.command ?? ""] !== true;
   }
-  function providerMissingLabel(p: (typeof MODEL_CATALOG)[number]): string {
-    return p.kind === "cli" ? `install ${p.command}` : `add ${p.apiKeyEnv}`;
+  /** Whether a preset's required API key is known-missing. */
+  function keyMissing(p: RunnerPreset): boolean {
+    const env = p.kind === "http-responses" ? p.apiKeyEnv : p.requiresEnv;
+    return env !== undefined && knowKeys && !storedKeys.has(env);
+  }
+  function presetMissing(p: RunnerPreset): boolean {
+    return commandMissing(p) || keyMissing(p);
+  }
+  function presetMissingLabel(p: RunnerPreset): string {
+    if (commandMissing(p)) return `install ${p.command}`;
+    const env = p.kind === "http-responses" ? p.apiKeyEnv : p.requiresEnv;
+    return `add ${env}`;
   }
 
-  function modelSelect(role: "writer" | "reviewer", onChange: () => void): HTMLSelectElement {
-    const current = settings[role];
-    const select = h("select", { "aria-label": `${role} model` }) as HTMLSelectElement;
-    for (const provider of MODEL_CATALOG) {
-      const missing = providerMissing(provider);
-      const group = h("optgroup", { label: missing ? `${provider.label} (${providerMissingLabel(provider)})` : provider.label }) as HTMLOptGroupElement;
-      for (const m of provider.models) {
-        const opt = h("option", { value: `${provider.id}::${m.id}` }, [m.label]) as HTMLOptionElement;
-        if (current.provider === provider.id && current.model === m.id) opt.selected = true;
-        group.append(opt);
+  // One picker per role: a preset dropdown + (for configurable presets) an
+  // editable model id. Replaces the old provider/model matrix with the
+  // first-class presets.
+  function rolePicker(role: "writer" | "reviewer", note: HTMLElement): HTMLElement {
+    const wrap = h("div", { class: "preset-pick" });
+    const select = h("select", { "aria-label": `${role} preset` }) as HTMLSelectElement;
+    for (const preset of PRESETS) {
+      const missing = presetMissing(preset);
+      const opt = h("option", { value: preset.id }, [
+        missing ? `${preset.label} (${presetMissingLabel(preset)})` : preset.label,
+      ]) as HTMLOptionElement;
+      if (settings[role].preset === preset.id) opt.selected = true;
+      select.append(opt);
+    }
+
+    const modelInput = h("input", {
+      type: "text",
+      class: "model-id",
+      "aria-label": `${role} model id`,
+      autocomplete: "off",
+      spellcheck: "false",
+    }) as HTMLInputElement;
+
+    function syncModelInput(): void {
+      const preset = getPreset(settings[role].preset);
+      if (preset?.configurableModel) {
+        modelInput.hidden = false;
+        modelInput.placeholder = preset.defaultModel;
+        modelInput.value = settings[role].model || preset.defaultModel;
+      } else {
+        modelInput.hidden = true;
       }
-      select.append(group);
     }
+
     select.addEventListener("change", () => {
-      const [p, m] = select.value.split("::");
-      settings[role] = { provider: p!, model: m! } as ModelChoice;
+      // Reset the model to the new preset's default when switching presets.
+      settings[role] = { preset: select.value, model: "" } as ModelChoice;
       persist();
-      onChange();
+      syncModelInput();
+      setNote(note, role);
     });
-    return select;
+    modelInput.addEventListener("input", () => {
+      settings[role] = { preset: settings[role].preset, model: modelInput.value.trim() };
+      persist();
+      setNote(note, role);
+    });
+
+    syncModelInput();
+    wrap.append(select, modelInput);
+    return wrap;
   }
 
   function noteFor(role: "writer" | "reviewer", choice: ModelChoice): HTMLElement {
     const note = h("div", { class: "model-note" });
-    const found = findModel(choice);
-    if (!found) return note;
-    const { provider } = found;
-    if (provider.kind === "http" && knowKeys && !storedKeys.has(provider.apiKeyEnv ?? "")) {
+    const preset = getPreset(choice.preset);
+    if (!preset) return note;
+
+    if (keyMissing(preset)) {
+      const env = preset.kind === "http-responses" ? preset.apiKeyEnv : preset.requiresEnv;
       note.className = "model-note warn";
-      const link = h("button", { type: "button", class: "linklike" }, [`Add ${provider.apiKeyEnv}`]);
+      const link = h("button", { type: "button", class: "linklike" }, [`Add ${env}`]);
       link.addEventListener("click", () => navigate("secrets"));
-      note.append(h("span", {}, [`No key stored for ${provider.label}. `]), link);
+      note.append(h("span", {}, [`No key stored for ${preset.label}. `]), link);
       return note;
     }
-    if (provider.kind === "cli" && isTauri() && installed[provider.command ?? ""] !== true) {
+    if (commandMissing(preset)) {
       note.className = "model-note warn";
-      note.append(h("span", {}, [`${provider.command} is not installed — install it to use ${provider.label}.`]));
+      note.append(h("span", {}, [`${preset.command} is not installed — install it to use ${preset.label}.`]));
       return note;
     }
     if (role === "writer") {
-      if (editsFiles(choice)) {
+      if (preset.editsFiles) {
         note.className = "model-note ok";
-        note.append(h("span", {}, ["Edits files directly — runs can produce real, committable changes."]));
+        note.append(h("span", {}, [`${preset.authHint} Edits files directly — runs can produce real, committable changes.`]));
       } else {
         note.className = "model-note warn";
-        note.append(h("span", {}, ["HTTP models return a diff but don't edit files. Pick a CLI writer (Codex / Kiro) to change a repo."]));
+        note.append(h("span", {}, ["Returns a diff but doesn't edit files. Pick a CLI writer (Codex CLI / Kiro CLI) to change a repo."]));
       }
       return note;
     }
-    note.append(h("span", {}, [provider.kind === "http" ? `Uses ${provider.apiKeyEnv}` : `Local command: ${provider.command}`]));
+    note.append(h("span", {}, [preset.authHint]));
     return note;
   }
 
@@ -434,8 +475,8 @@ async function renderModels(): Promise<void> {
     target.className = fresh.className;
     target.replaceChildren(...Array.from(fresh.childNodes));
   }
-  const writerSelect = modelSelect("writer", () => setNote(writerNote, "writer"));
-  const reviewerSelect = modelSelect("reviewer", () => setNote(reviewerNote, "reviewer"));
+  const writerSelect = rolePicker("writer", writerNote);
+  const reviewerSelect = rolePicker("reviewer", reviewerNote);
   setNote(writerNote, "writer");
   setNote(reviewerNote, "reviewer");
 
@@ -485,24 +526,42 @@ async function renderModels(): Promise<void> {
     ]),
   );
 
+  // -- Kiro CLI trusted tools (only meaningful for the kiro-cli preset).
+  const kiroTrustInput = h("input", {
+    type: "text",
+    value: settings.kiroTrustTools,
+    placeholder: "fs_read,fs_write,execute_bash (empty = --trust-all-tools)",
+    autocomplete: "off",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+  kiroTrustInput.addEventListener("input", () => {
+    settings.kiroTrustTools = kiroTrustInput.value;
+    persist();
+  });
+  const kiroTrustField = h("label", { class: "inline-label" }, [
+    "Kiro CLI trusted tools",
+    kiroTrustInput,
+  ]);
+
   const modelsCard = h("div", { class: "card" }, [
-    h("h3", {}, ["Models"]),
+    h("h3", {}, ["Runner presets"]),
     h("div", { class: "model-grid" }, [
       h("div", { class: "model-pick" }, [
-        h("label", { class: "model-pick-head" }, [icon(ICONS.write, "mp-ico"), "Writer", h("span", { class: "desc" }, ["Writes the code"])]),
+        h("label", { class: "model-pick-head" }, [icon(ICONS.write, "mp-ico"), "Writer", h("span", { class: "desc" }, ["Writes the code (actor)"])]),
         writerSelect,
         writerNote,
       ]),
       h("div", { class: "model-pick" }, [
-        h("label", { class: "model-pick-head" }, [icon(ICONS.review, "mp-ico"), "Reviewer", h("span", { class: "desc" }, ["Reviews the code"])]),
+        h("label", { class: "model-pick-head" }, [icon(ICONS.review, "mp-ico"), "Reviewer", h("span", { class: "desc" }, ["Reviews the code (critic)"])]),
         reviewerSelect,
         reviewerNote,
       ]),
     ]),
+    kiroTrustField,
     h("div", { class: "desc keys-hint" }, [
       isTauri()
-        ? "HTTP models are unlocked by the API keys you store under Secrets; CLI agents must be installed locally."
-        : "HTTP models are unlocked by the API keys provided in the engine's environment.",
+        ? "Codex CLI / Kiro CLI must be installed locally; the OpenAI Responses preset and Kiro CLI need their API keys stored under Secrets."
+        : "API-key presets are unlocked by the keys provided in the engine's environment; CLI presets must be installed on the engine host.",
     ]),
     advancedDetails,
   ]);
@@ -669,7 +728,7 @@ async function renderModels(): Promise<void> {
   const envPanel = h("div", { class: "env-checks" });
   if (isTauri()) {
     envPanel.append(h("div", { class: "desc" }, ["Detected tools:"]));
-    for (const name of ["codex", "kiro", "gh"]) {
+    for (const name of ["codex", "kiro-cli", "gh"]) {
       const ok = installed[name] === true;
       envPanel.append(h("span", { class: `tool ${ok ? "ok" : "missing"}` }, [`${name}: ${ok ? "installed" : "missing"}`]));
     }
@@ -686,7 +745,144 @@ async function renderModels(): Promise<void> {
     envPanel,
   ]);
 
-  page.append(repoCard, modelsCard, optionsCard, publishCard);
+  // -- Phone updates (Telegram). Desktop-only: stores the bot token + chat id
+  // as secrets the engine reads at startup. The engine connects OUTBOUND to
+  // Telegram (long-polling), so nothing inbound is ever exposed.
+  const tgCard = h("div", { class: "card" }, [
+    h("h3", {}, ["Phone updates (Telegram)"]),
+    h("div", { class: "desc" }, [
+      "Get a message when a run finishes, and reply with a new goal to keep the engine working. The engine only makes outbound calls to Telegram — it stays loopback-only and is never exposed.",
+    ]),
+  ]);
+  if (!isTauri()) {
+    tgCard.append(
+      h("div", { class: "desc" }, [
+        "Desktop only. In a browser, set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the engine's environment.",
+      ]),
+    );
+  } else {
+    let hasToken = storedKeys.has("TELEGRAM_BOT_TOKEN");
+    let hasChat = storedKeys.has("TELEGRAM_CHAT_ID");
+    const tgStatus = h("div", { class: "hint" });
+    const paintTgStatus = (): void => {
+      tgStatus.textContent = `Bot token: ${hasToken ? "stored" : "not set"} · Chat ID: ${hasChat ? "stored" : "not set"}`;
+    };
+    paintTgStatus();
+    const tokenInput = h("input", {
+      type: "password",
+      autocomplete: "off",
+      placeholder: hasToken ? "•••••• stored — leave blank to keep" : "123456:ABC-DEF… (from @BotFather)",
+    }) as HTMLInputElement;
+    const chatInput = h("input", {
+      type: "text",
+      autocomplete: "off",
+      spellcheck: "false",
+      placeholder: hasChat ? "stored — leave blank to keep" : "your numeric chat id",
+    }) as HTMLInputElement;
+    const tgError = h("div", { class: "hint", hidden: "true" });
+    const saveBtn = h("button", { type: "button", class: "primary" }, ["Save & restart engine"]);
+    const removeBtn = h("button", { type: "button", class: "ghost" }, ["Remove"]);
+
+    // Re-reads the keychain index so the cached has* flags + status reflect what
+    // is actually stored after a mutation, rather than an optimistic guess.
+    const refreshTgStored = async (): Promise<void> => {
+      try {
+        const keys = new Set(await listSecretKeys());
+        hasToken = keys.has("TELEGRAM_BOT_TOKEN");
+        hasChat = keys.has("TELEGRAM_CHAT_ID");
+      } catch {
+        /* leave cached flags as-is if the index can't be read */
+      }
+      paintTgStatus();
+    };
+
+    saveBtn.addEventListener("click", async () => {
+      tgError.hidden = true;
+      const tok = tokenInput.value.trim();
+      const chat = chatInput.value.trim();
+      // Both secrets are required for the relay to work — count an already-stored
+      // value as satisfied so a user editing one field need not re-enter both.
+      if (!tok && !hasToken) {
+        tgError.textContent = "Enter a bot token from @BotFather.";
+        tgError.className = "hint error";
+        tgError.hidden = false;
+        return;
+      }
+      if (!chat && !hasChat) {
+        tgError.textContent = "Enter your chat id (message @userinfobot to find it).";
+        tgError.className = "hint error";
+        tgError.hidden = false;
+        return;
+      }
+      if (chat && !/^-?\d+$/.test(chat)) {
+        tgError.textContent = "Chat ID must be a number (message @userinfobot to find yours).";
+        tgError.className = "hint error";
+        tgError.hidden = false;
+        return;
+      }
+      saveBtn.setAttribute("disabled", "true");
+      saveBtn.textContent = "Saving…";
+      try {
+        if (tok) await setSecret("TELEGRAM_BOT_TOKEN", tok);
+        if (chat) await setSecret("TELEGRAM_CHAT_ID", chat);
+        tokenInput.value = "";
+        chatInput.value = "";
+        const restarted = await restartEngineGuarded();
+        await refreshTgStored();
+        tgError.textContent = restarted
+          ? "Saved. The relay will start polling for your messages."
+          : "Saved — restart the engine (Secrets page) to apply.";
+        tgError.className = "hint ok";
+        tgError.hidden = false;
+      } catch (err) {
+        await refreshTgStored();
+        tgError.textContent = `Failed: ${(err as Error).message}`;
+        tgError.className = "hint error";
+        tgError.hidden = false;
+      } finally {
+        saveBtn.removeAttribute("disabled");
+        saveBtn.textContent = "Save & restart engine";
+      }
+    });
+
+    removeBtn.addEventListener("click", async () => {
+      tgError.hidden = true;
+      removeBtn.setAttribute("disabled", "true");
+      try {
+        await deleteSecret("TELEGRAM_BOT_TOKEN");
+        await deleteSecret("TELEGRAM_CHAT_ID");
+        const restarted = await restartEngineGuarded();
+        await refreshTgStored();
+        tgError.textContent = restarted
+          ? "Telegram notifications disabled."
+          : "Removed — restart the engine (Secrets page) to apply.";
+        tgError.className = "hint";
+        tgError.hidden = false;
+      } catch (err) {
+        await refreshTgStored();
+        tgError.textContent = `Failed: ${(err as Error).message}`;
+        tgError.className = "hint error";
+        tgError.hidden = false;
+      } finally {
+        removeBtn.removeAttribute("disabled");
+      }
+    });
+
+    tgCard.append(
+      tgStatus,
+      h("div", { class: "field-grid" }, [
+        h("label", { class: "inline-label" }, ["Bot token", tokenInput]),
+        h("label", { class: "inline-label" }, ["Chat ID", chatInput]),
+      ]),
+      h("div", { class: "actions" }, [saveBtn, removeBtn]),
+      tgError,
+      h("small", { class: "desc" }, [
+        "Saving restarts the engine to apply (you'll be warned if runs are active). The token + chat id are stored in your OS keychain.",
+      ]),
+    );
+  }
+
+  page.append(repoCard, modelsCard, optionsCard, publishCard, tgCard);
 }
 
 // --- Monitor view -----------------------------------------------------------
@@ -1166,25 +1362,25 @@ async function renderSecrets(): Promise<void> {
   const listEl = h("ul", { class: "secret-list" });
   card.append(h("h3", {}, ["Stored keys"]), listEl);
 
-  // Models-by-key: makes it explicit which models each environment key unlocks,
-  // so the user can see exactly what a key buys them before (or after) adding it.
-  const catalogCard = h("div", { class: "card" }, [h("h3", {}, ["Models by environment key"])]);
+  // Presets-by-key: makes it explicit which environment key unlocks which
+  // preset, so the user can see exactly what a key buys them before/after adding it.
+  const catalogCard = h("div", { class: "card" }, [h("h3", {}, ["Presets by environment key"])]);
   const catalogList = h("div", { class: "key-catalog" });
   catalogCard.append(catalogList);
 
   function renderCatalog(stored: Set<string>): void {
     catalogList.innerHTML = "";
-    for (const provider of MODEL_CATALOG) {
-      if (provider.kind !== "http" || !provider.apiKeyEnv) continue; // CLI agents have no key
-      const has = stored.has(provider.apiKeyEnv);
+    for (const preset of PRESETS) {
+      const env = preset.kind === "http-responses" ? preset.apiKeyEnv : preset.requiresEnv;
+      if (!env) continue; // e.g. codex-cli authenticates via `codex login`
+      const has = stored.has(env);
       const head = h("div", { class: "key-cat-head" }, [
         icon(ICONS.key, "key-cat-ico"),
-        h("code", {}, [provider.apiKeyEnv]),
-        h("span", { class: "key-cat-prov" }, [provider.label]),
+        h("code", {}, [env]),
+        h("span", { class: "key-cat-prov" }, [preset.label]),
         h("span", { class: `key-cat-status ${has ? "on" : "off"}` }, [has ? "stored" : "not stored"]),
       ]);
-      const models = h("div", { class: "key-cat-models" });
-      for (const m of provider.models) models.append(h("span", { class: "model-tag" }, [m.label]));
+      const models = h("div", { class: "key-cat-models" }, [h("span", { class: "desc" }, [preset.description])]);
       catalogList.append(h("div", { class: `key-cat${has ? " on" : ""}` }, [head, models]));
     }
   }
@@ -1337,6 +1533,30 @@ async function renderSecrets(): Promise<void> {
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+/**
+ * Restarts the engine, but first warns if runs are active (a restart re-spawns
+ * the sidecar and ABORTS in-flight runs). Returns true if the restart actually
+ * happened. Shared by the Secrets screen and the Telegram settings card so both
+ * use the same guard rather than silently killing runs.
+ */
+async function restartEngineGuarded(): Promise<boolean> {
+  let active = 0;
+  try {
+    active = await activeRunCount();
+  } catch {
+    /* unknown — treat as nothing to lose */
+  }
+  if (active > 0) {
+    const ok = window.confirm(
+      `${active} run${active === 1 ? " is" : "s are"} still active. ` +
+        `Restarting the engine will abort ${active === 1 ? "it" : "them"}. Continue?`,
+    );
+    if (!ok) return false;
+  }
+  await restartEngine();
+  return true;
 }
 
 async function checkEngine(): Promise<void> {

@@ -8,6 +8,7 @@ import {
   isGitRepo,
   remoteUrl,
   spawnGit,
+  worktreeDiff,
 } from "../src/workspace/git.js";
 
 /** Initializes a throwaway git repo and returns its path. */
@@ -57,5 +58,26 @@ describe("git helpers", () => {
 
     // feature is one commit ahead of main.
     expect(await commitCount(repo, "feature", "main")).toBe(1);
+  });
+
+  it("worktreeDiff captures modified AND newly created files", async () => {
+    // No changes yet.
+    expect((await worktreeDiff(repo)).trim()).toBe("");
+
+    // Modify a tracked file and add a brand-new (untracked) file.
+    await writeFile(join(repo, "base.txt"), "base\nmore\n");
+    await writeFile(join(repo, "new.txt"), "hello\n");
+
+    const diff = await worktreeDiff(repo);
+    expect(diff).toContain("base.txt");
+    expect(diff).toContain("+more");
+    // The untracked file must appear as an addition (intent-to-add).
+    expect(diff).toContain("new.txt");
+    expect(diff).toContain("+hello");
+  });
+
+  it("worktreeDiff never throws on a non-repo and returns empty", async () => {
+    const plain = await mkdtemp(join(tmpdir(), "loopwright-plain-"));
+    expect(await worktreeDiff(plain)).toBe("");
   });
 });

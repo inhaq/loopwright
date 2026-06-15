@@ -13,13 +13,29 @@ use std::process::Command;
 
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
+use tokio::sync::oneshot;
 
 /// Opens the native folder picker and returns the chosen absolute path (or
-/// `None` if the user cancelled). Blocking is fine here: Tauri runs command
-/// handlers off the main thread, and the picker is modal by design.
+/// `None` if the user cancelled).
+///
+/// This command MUST be `async`. Tauri runs synchronous command handlers on the
+/// main (UI) thread, and the native folder dialog needs that same thread's event
+/// loop to pump. Calling the *blocking* picker from a sync command therefore
+/// deadlocks: the main thread blocks waiting for a dialog that can never run,
+/// freezing the whole app. Instead we use the non-blocking `pick_folder`, which
+/// shows the dialog on the main thread and invokes our callback when the user
+/// chooses; the callback hands the result back over a oneshot channel that this
+/// async handler (running off the main thread) awaits.
 #[tauri::command]
-pub fn pick_directory(app: AppHandle) -> Result<Option<String>, String> {
-    let picked = app.dialog().file().blocking_pick_folder();
+pub async fn pick_directory(app: AppHandle) -> Result<Option<String>, String> {
+    let (tx, rx) = oneshot::channel();
+    app.dialog().file().pick_folder(move |picked| {
+        // The receiver is only dropped if this command was cancelled; ignore.
+        let _ = tx.send(picked);
+    });
+    let picked = rx
+        .await
+        .map_err(|_| "folder picker was cancelled".to_string())?;
     Ok(picked
         .and_then(|p| p.into_path().ok())
         .map(|p| p.to_string_lossy().to_string()))
@@ -27,8 +43,11 @@ pub fn pick_directory(app: AppHandle) -> Result<Option<String>, String> {
 
 /// True when `path` is inside a git working tree. Mirrors the engine's
 /// `isGitRepo` so the UI can validate a selection before a run is started.
+///
+/// `async` so the `git` subprocess runs off the main thread and never stalls the
+/// UI (e.g. on a cold filesystem cache or a slow/networked working copy).
 #[tauri::command]
-pub fn check_git_repo(path: String) -> bool {
+pub async fn check_git_repo(path: String) -> bool {
     Command::new("git")
         .args(["-C", &path, "rev-parse", "--is-inside-work-tree"])
         .output()
@@ -38,9 +57,12 @@ pub fn check_git_repo(path: String) -> bool {
 
 /// For each requested tool name, reports whether it is found on PATH. Used by
 /// the provider-onboarding panel to show "installed / missing" for tools like
-/// `codex`, `kiro`, and `gh`.
+/// `codex`, `kiro-cli`, and `gh`.
+///
+/// `async` so the PATH scan (filesystem stats per candidate) runs off the main
+/// thread and keeps the UI responsive.
 #[tauri::command]
-pub fn which_commands(names: Vec<String>) -> HashMap<String, bool> {
+pub async fn which_commands(names: Vec<String>) -> HashMap<String, bool> {
     names
         .into_iter()
         .map(|n| {
