@@ -79,12 +79,39 @@ export function redact(input: string): string {
   return out;
 }
 
-/** Redact and cap length so a runaway log can't blow up a critic call. */
+/**
+ * Redact and cap length so a runaway log can't blow up a critic call.
+ *
+ * Structure-aware (inspired by pi's harness `truncate.ts`): when the content
+ * has line structure — diffs, build/test output — the head is snapped back to
+ * the last line boundary within budget and the tail forward to the next one, so
+ * the critic never reasons over a line cut mid-token. The elision marker
+ * reports how much (chars and lines) was dropped. A single very long line with
+ * no boundaries falls back to a hard head/tail char slice.
+ */
 export function redactAndTruncate(input: string, maxChars = 8_000): string {
   const redacted = redact(input);
   if (redacted.length <= maxChars) return redacted;
-  const head = redacted.slice(0, Math.floor(maxChars * 0.7));
-  const tail = redacted.slice(-Math.floor(maxChars * 0.2));
-  const omitted = redacted.length - head.length - tail.length;
-  return `${head}\n...[${omitted} chars truncated]...\n${tail}`;
+
+  const headBudget = Math.floor(maxChars * 0.7);
+  const tailBudget = Math.floor(maxChars * 0.2);
+
+  // Head: take the budget, then trim back to the last complete line.
+  let head = redacted.slice(0, headBudget);
+  const headNl = head.lastIndexOf("\n");
+  if (headNl > 0) head = head.slice(0, headNl);
+
+  // Tail: take the budget from the end, then trim forward to start of a line.
+  let tail = redacted.slice(redacted.length - tailBudget);
+  const tailNl = tail.indexOf("\n");
+  if (tailNl >= 0 && tailNl < tail.length - 1) tail = tail.slice(tailNl + 1);
+
+  const omittedChars = redacted.length - head.length - tail.length;
+  if (omittedChars <= 0) return redacted; // budgets overlapped; nothing to drop
+
+  const omittedLines =
+    redacted.slice(head.length, redacted.length - tail.length).split("\n").length - 1;
+  const linesPart = omittedLines > 0 ? ` / ${omittedLines} lines` : "";
+
+  return `${head}\n...[${omittedChars} chars${linesPart} truncated]...\n${tail}`;
 }
