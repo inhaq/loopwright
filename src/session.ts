@@ -141,26 +141,42 @@ export async function runGoal(
     // (Task 22). When persisting, calls are recorded to the store's event stream.
     const onRunnerCall: RunnerCallSink | undefined =
       store && sessionId
-        ? (e) =>
-            store.recordEvent({
-              sessionId,
-              at: e.at,
-              type: EVENT_TYPES.runnerCall,
-              data: e as unknown as Record<string, unknown>,
-            })
+        ? (e) => {
+            void store
+              .recordEvent({
+                sessionId,
+                at: e.at,
+                type: EVENT_TYPES.runnerCall,
+                data: e as unknown as Record<string, unknown>,
+              })
+              .catch((err) => {
+                opts.log?.(
+                  `failed to persist runner_call: ${String((err as Error)?.message ?? err)}`,
+                );
+              });
+          }
         : roleOpts.onRunnerCall;
     // Mid-call runner activity (sub-step streaming): tool calls from a native
     // agent runner's inner loop flow to the same event stream, so the monitor
     // (and the durable trace) see live progress within a single runner call.
     const onActivity: ((e: RunnerActivityEvent) => void) | undefined =
       store && sessionId
-        ? (e) =>
-            store.recordEvent({
-              sessionId,
-              at: e.at,
-              type: EVENT_TYPES.runnerActivity,
-              data: e as unknown as Record<string, unknown>,
-            })
+        ? (e) => {
+            // Fire-and-forget persistence: never let a rejected recordEvent
+            // surface as an unhandled rejection and destabilize the run.
+            void store
+              .recordEvent({
+                sessionId,
+                at: e.at,
+                type: EVENT_TYPES.runnerActivity,
+                data: e as unknown as Record<string, unknown>,
+              })
+              .catch((err) => {
+                opts.log?.(
+                  `failed to persist runner_activity: ${String((err as Error)?.message ?? err)}`,
+                );
+              });
+          }
         : roleOpts.onActivity;
     const { actor, critic } = createRoles(config, {
       ...roleOpts,
