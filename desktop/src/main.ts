@@ -708,6 +708,7 @@ function renderMonitor(sessionId: string, goal: string): void {
     type: "text",
     class: "nudge-input",
     placeholder: "Nudge the agent…",
+    "aria-label": "Nudge the in-flight run",
   }) as HTMLInputElement;
   const nudgeBtn = h("button", { class: "small" }, ["Nudge"]);
 
@@ -732,10 +733,14 @@ function renderMonitor(sessionId: string, goal: string): void {
   });
 
   // Nudge control: inject steering guidance into the running agent.
+  let nudging = false;
   const sendNudge = async (): Promise<void> => {
+    if (nudging) return;
     const text = nudgeInput.value.trim();
     if (!text) return;
+    nudging = true;
     nudgeBtn.setAttribute("disabled", "true");
+    nudgeInput.setAttribute("disabled", "true");
     try {
       await nudgeRun(sessionId, text);
       nudgeInput.value = "";
@@ -743,12 +748,17 @@ function renderMonitor(sessionId: string, goal: string): void {
     } catch (err) {
       plan.textContent = `Nudge failed: ${(err as Error).message}`;
     } finally {
+      nudging = false;
       nudgeBtn.removeAttribute("disabled");
+      nudgeInput.removeAttribute("disabled");
     }
   };
   nudgeBtn.addEventListener("click", () => void sendNudge());
   nudgeInput.addEventListener("keydown", (ev) => {
-    if ((ev as KeyboardEvent).key === "Enter") void sendNudge();
+    if ((ev as KeyboardEvent).key === "Enter") {
+      ev.preventDefault();
+      void sendNudge();
+    }
   });
 
   const usage = h("div", { class: "card" }, [
