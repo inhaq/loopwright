@@ -99,12 +99,12 @@ export function redactAndTruncate(input: string, maxChars = 8_000): string {
   // Head: take the budget, then trim back to the last complete line.
   let head = redacted.slice(0, headBudget);
   const headNl = head.lastIndexOf("\n");
-  if (headNl > 0) head = head.slice(0, headNl);
+  if (headNl >= 0) head = head.slice(0, headNl);
 
   // Tail: take the budget from the end, then trim forward to start of a line.
   let tail = redacted.slice(redacted.length - tailBudget);
   const tailNl = tail.indexOf("\n");
-  if (tailNl >= 0 && tailNl < tail.length - 1) tail = tail.slice(tailNl + 1);
+  if (tailNl >= 0) tail = tail.slice(tailNl + 1);
 
   const omittedChars = redacted.length - head.length - tail.length;
   if (omittedChars <= 0) return redacted; // budgets overlapped; nothing to drop
