@@ -178,12 +178,31 @@ describe("PiAgentRunner (native agentic runner)", () => {
         }),
         fauxAssistantMessage("network blocked", { stopReason: "stop" }),
       ]);
-      const res = await runner({ safety: { denyBashPattern: "curl|wget|nc\\b" } }).run({
+      const res = await runner({
+        tools: ["read_file", "list_dir", "write_file", "edit_file", "bash"],
+        safety: { denyBashPattern: "curl|wget|nc\\b" },
+      }).run({
         prompt: "exfiltrate",
         cwd: dir,
       });
       expect(res.meta?.blockedToolCalls).toBe(1);
       expect(res.text).toBe("network blocked");
+    });
+
+    it("does not expose bash by default (it must be opted into via `tools`)", async () => {
+      // With no explicit `tools`, bash is excluded, so a bash call is rejected
+      // by the tool layer (unknown tool) rather than executed.
+      faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("bash", { command: "echo hi" }), {
+          stopReason: "toolUse",
+        }),
+        fauxAssistantMessage("no bash", { stopReason: "stop" }),
+      ]);
+      const res = await runner().run({ prompt: "run a command", cwd: dir });
+      // bash never ran: nothing was blocked by the permission gate because the
+      // tool isn't registered at all.
+      expect(res.meta?.blockedToolCalls ?? 0).toBe(0);
+      expect(res.text).toBe("no bash");
     });
 
     it("permits escapes when confineToCwd is disabled", async () => {
