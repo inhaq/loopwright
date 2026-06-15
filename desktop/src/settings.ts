@@ -14,7 +14,7 @@
  * HTTP runners only return a diff the engine does not apply.
  */
 
-export type ProviderKind = "http" | "cli";
+export type ProviderKind = "http" | "cli" | "agent";
 
 export interface CatalogModel {
   /** model id sent to the provider (the runner profile's `model`) */
@@ -35,7 +35,12 @@ export interface Provider {
   apiKeyEnv?: string;
   /** cli: the command that must be on PATH (used for install detection) */
   command?: string;
-  /** true for CLI actors that edit files directly (can produce real changes) */
+  /**
+   * agent: the pi-ai provider id used to resolve the model (e.g. "anthropic").
+   * Agent providers run a real in-process tool-calling loop and edit files.
+   */
+  agentProvider?: string;
+  /** true for actors that edit files directly (CLI agents and native agents) */
   editsFiles?: boolean;
   /** models this provider offers */
   models: CatalogModel[];
@@ -102,6 +107,47 @@ export const MODEL_CATALOG: Provider[] = [
     command: "kiro",
     editsFiles: true,
     models: [{ id: "kiro", label: "Kiro (edits files)" }],
+  },
+  // Native agent runners: a real in-process tool-calling loop (pi agent-core +
+  // ai) that edits files directly. Grouped by the same API key as the matching
+  // HTTP provider; model ids must be ones pi-ai knows for that provider.
+  {
+    id: "anthropic-agent",
+    label: "Anthropic (agent)",
+    kind: "agent",
+    agentProvider: "anthropic",
+    apiKeyEnv: "ANTHROPIC_API_KEY",
+    editsFiles: true,
+    models: [
+      { id: "claude-3-7-sonnet-20250219", label: "Claude 3.7 Sonnet (edits files)" },
+      { id: "claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet (edits files)" },
+      { id: "claude-3-5-haiku-latest", label: "Claude 3.5 Haiku (edits files)" },
+    ],
+  },
+  {
+    id: "openai-agent",
+    label: "OpenAI (agent)",
+    kind: "agent",
+    agentProvider: "openai",
+    apiKeyEnv: "OPENAI_API_KEY",
+    editsFiles: true,
+    models: [
+      { id: "gpt-4.1", label: "GPT-4.1 (edits files)" },
+      { id: "gpt-4o", label: "GPT-4o (edits files)" },
+      { id: "o4-mini", label: "o4-mini (edits files)" },
+    ],
+  },
+  {
+    id: "google-agent",
+    label: "Google (agent)",
+    kind: "agent",
+    agentProvider: "google",
+    apiKeyEnv: "GEMINI_API_KEY",
+    editsFiles: true,
+    models: [
+      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro (edits files)" },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash (edits files)" },
+    ],
   },
 ];
 
@@ -276,6 +322,17 @@ interface RunnerProfile {
 
 function profileFor(id: string, choice: ModelChoice): RunnerProfile {
   const provider = getProvider(choice.provider) ?? firstProvider;
+  if (provider.kind === "agent") {
+    return {
+      id,
+      kind: "agent",
+      model: choice.model,
+      options: {
+        provider: provider.agentProvider ?? provider.id,
+        ...(provider.apiKeyEnv ? { apiKeyEnv: provider.apiKeyEnv } : {}),
+      },
+    };
+  }
   if (provider.kind === "cli") {
     if (provider.id === "kiro") {
       return {

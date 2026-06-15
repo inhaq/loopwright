@@ -69,6 +69,12 @@ export interface RunnerActorOptions {
   signal?: AbortSignal;
   /** sink for mid-call runner activity (sub-step streaming), if any */
   onActivity?: (e: RunnerActivityEvent) => void;
+  /**
+   * Steering registration. Threaded into each runner call as `req.steering`;
+   * a runner with an inner loop invokes it with a `steer(text)` bound to that
+   * live call, so a supervisor can nudge the in-flight work.
+   */
+  onSteer?: (steer: (text: string) => void) => void;
 }
 
 export interface RunnerCriticOptions {
@@ -79,6 +85,8 @@ export interface RunnerCriticOptions {
   signal?: AbortSignal;
   /** sink for mid-call runner activity (sub-step streaming), if any */
   onActivity?: (e: RunnerActivityEvent) => void;
+  /** steering registration, threaded into each runner call as req.steering */
+  onSteer?: (steer: (text: string) => void) => void;
 }
 
 /**
@@ -117,6 +125,8 @@ export class RunnerActor implements Actor {
   private readonly signal: AbortSignal | undefined;
   /** per-call activity sink, enriched with role identity (undefined = off) */
   private readonly onEvent: ((a: RunnerActivity) => void) | undefined;
+  /** steering registration passed as req.steering on every run (undefined = off) */
+  private readonly steerRegister: ((steer: (text: string) => void) => void) | undefined;
 
   constructor(runner: AgentRunner, opts: RunnerActorOptions = {}) {
     this.runner = runner;
@@ -126,6 +136,7 @@ export class RunnerActor implements Actor {
     this.log = opts.log;
     this.signal = opts.signal;
     this.onEvent = activityForwarder(runner, "actor", opts.onActivity);
+    this.steerRegister = opts.onSteer;
   }
 
   async draftPlan(goal: string, feedback?: Finding[]): Promise<PlanDraftResult> {
@@ -163,6 +174,7 @@ export class RunnerActor implements Actor {
       system: this.prompts.system,
       ...(this.signal ? { signal: this.signal } : {}),
       ...(this.onEvent ? { onEvent: this.onEvent } : {}),
+      ...(this.steerRegister ? { steering: this.steerRegister } : {}),
     });
     return { text: res.text, quotaExhausted: res.quotaExhausted };
   }
@@ -180,6 +192,7 @@ export class RunnerActor implements Actor {
       system: this.prompts.system,
       ...(this.signal ? { signal: this.signal } : {}),
       ...(this.onEvent ? { onEvent: this.onEvent } : {}),
+      ...(this.steerRegister ? { steering: this.steerRegister } : {}),
     });
     if (res.quotaExhausted) {
       throw new RunnerRoleError(`Actor ${what} failed: runner quota exhausted.`, {
@@ -196,6 +209,7 @@ export class RunnerActor implements Actor {
         system: this.prompts.system,
         ...(this.signal ? { signal: this.signal } : {}),
         ...(this.onEvent ? { onEvent: this.onEvent } : {}),
+        ...(this.steerRegister ? { steering: this.steerRegister } : {}),
       });
       if (res.quotaExhausted) {
         throw new RunnerRoleError(`Actor ${what} failed: runner quota exhausted.`, {
@@ -220,6 +234,8 @@ export class RunnerCritic implements Critic {
   private readonly signal: AbortSignal | undefined;
   /** per-call activity sink, enriched with role identity (undefined = off) */
   private readonly onEvent: ((a: RunnerActivity) => void) | undefined;
+  /** steering registration passed as req.steering on every run (undefined = off) */
+  private readonly steerRegister: ((steer: (text: string) => void) => void) | undefined;
 
   constructor(runner: AgentRunner, opts: RunnerCriticOptions = {}) {
     this.runner = runner;
@@ -227,6 +243,7 @@ export class RunnerCritic implements Critic {
     this.cwd = opts.cwd ?? ".";
     this.signal = opts.signal;
     this.onEvent = activityForwarder(runner, "critic", opts.onActivity);
+    this.steerRegister = opts.onSteer;
   }
 
   /**
@@ -246,6 +263,7 @@ export class RunnerCritic implements Critic {
       system: this.prompts.system,
       ...(this.signal ? { signal: this.signal } : {}),
       ...(this.onEvent ? { onEvent: this.onEvent } : {}),
+      ...(this.steerRegister ? { steering: this.steerRegister } : {}),
     });
     return { text: res.text, quotaExhausted: res.quotaExhausted };
   }

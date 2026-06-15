@@ -41,6 +41,8 @@ export interface CreateRolesOptions {
   onRunnerCall?: RunnerCallSink;
   /** when set, mid-call runner activity (tool calls) streams to this sink */
   onActivity?: (e: RunnerActivityEvent) => void;
+  /** when set, each runner call registers its live steer handle here */
+  onSteer?: (steer: (text: string) => void) => void;
   /** cooperative cancellation, threaded into the actor/critic runner calls */
   signal?: AbortSignal;
 }
@@ -103,6 +105,7 @@ export function createRoles(
     ...(opts.log ? { log: opts.log } : {}),
     ...(opts.signal ? { signal: opts.signal } : {}),
     ...(opts.onActivity ? { onActivity: opts.onActivity } : {}),
+    ...(opts.onSteer ? { onSteer: opts.onSteer } : {}),
   });
 
   const critic = new RunnerCritic(instrumentedCritic, {
@@ -111,6 +114,7 @@ export function createRoles(
     ...(opts.log ? { log: opts.log } : {}),
     ...(opts.signal ? { signal: opts.signal } : {}),
     ...(opts.onActivity ? { onActivity: opts.onActivity } : {}),
+    ...(opts.onSteer ? { onSteer: opts.onSteer } : {}),
   });
 
   return { actor, critic };
