@@ -1,4 +1,5 @@
 import { z } from "zod";
+import path from "node:path";
 import type {
   AgentRunner,
   RunRequest,
@@ -69,6 +70,42 @@ export type PiAgentToolName = (typeof PI_AGENT_TOOL_NAMES)[number];
 
 const ThinkingLevelSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
+/** Tools whose first concern is a filesystem `path` argument. */
+const PATH_TOOLS = new Set<PiAgentToolName>(["read_file", "list_dir", "write_file", "edit_file"]);
+
+/**
+ * Tool-call permission policy, enforced via pi's `beforeToolCall` hook.
+ *
+ * `confineToCwd` (default on) blocks the file tools from touching anything
+ * outside the worktree root (absolute paths or `..` escapes), so a model can't
+ * read `/etc/passwd` or write outside the task's isolated checkout. NOTE: this
+ * confines the FILE tools only. `bash` is inherently unconfined — restrict it
+ * with `denyBashPattern`, and for real isolation run the engine in a container
+ * (see pi's containerization patterns).
+ */
+const SafetySchema = z
+  .object({
+    /** block file-tool paths that escape the worktree root */
+    confineToCwd: z.boolean().default(true),
+    /** case-insensitive regex; a matching `bash` command is blocked */
+    denyBashPattern: z
+      .string()
+      .refine(
+        (p) => {
+          try {
+            new RegExp(p, "i");
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        { message: "denyBashPattern must be a valid regular expression" },
+      )
+      .optional(),
+  })
+  .strict()
+  .default({ confineToCwd: true });
+
 export const PiAgentRunnerOptionsSchema = z
   .object({
     /** provider id for pi-ai model resolution, e.g. "anthropic", "openai", "google" */
@@ -83,6 +120,8 @@ export const PiAgentRunnerOptionsSchema = z
     timeoutMs: z.number().int().positive().default(10 * 60_000),
     /** restrict the toolset; defaults to all of {@link PI_AGENT_TOOL_NAMES} */
     tools: z.array(z.enum(PI_AGENT_TOOL_NAMES)).optional(),
+    /** tool-call permission policy (path confinement + bash denylist) */
+    safety: SafetySchema,
     /** rolling cap on the captured final answer text */
     maxOutputChars: z.number().int().positive().default(2_000_000),
   })
@@ -128,6 +167,12 @@ function assistantText(message: AssistantMessage): string {
 
 function isQuotaMessage(text: string): boolean {
   return /quota|rate.?limit|\b429\b|insufficient[_\s-]?quota|too many requests/i.test(text);
+}
+
+/** True when `target` resolves to `root` or a path nested under it (lexical). */
+function isInsideRoot(root: string, target: string): boolean {
+  const rel = path.relative(root, target);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
 export class PiAgentRunner implements AgentRunner {
@@ -279,6 +324,15 @@ export class PiAgentRunner implements AgentRunner {
     }
 
     const apiKey = this.apiKey();
+
+    // Permission gate (pi's beforeToolCall hook): confine file tools to the
+    // worktree and apply the optional bash denylist. A blocked call becomes an
+    // error tool result the model sees and can recover from.
+    const safety = this.opts.safety;
+    const cwdRoot = path.resolve(req.cwd);
+    const denyBash = safety.denyBashPattern ? new RegExp(safety.denyBashPattern, "i") : undefined;
+    let blockedToolCalls = 0;
+
     const agent = new Agent({
       initialState: {
         systemPrompt,
@@ -288,6 +342,24 @@ export class PiAgentRunner implements AgentRunner {
       },
       ...(this.deps.streamFn ? { streamFn: this.deps.streamFn } : {}),
       getApiKey: () => apiKey,
+      beforeToolCall: async ({ toolCall, args }) => {
+        const name = (toolCall as { name: string }).name as PiAgentToolName;
+        if (safety.confineToCwd && PATH_TOOLS.has(name)) {
+          const p = (args as { path?: unknown }).path;
+          if (typeof p === "string" && !isInsideRoot(cwdRoot, path.resolve(cwdRoot, p))) {
+            blockedToolCalls++;
+            return { block: true, reason: `path "${p}" escapes the workspace root; refused` };
+          }
+        }
+        if (name === "bash" && denyBash) {
+          const command = String((args as { command?: unknown }).command ?? "");
+          if (denyBash.test(command)) {
+            blockedToolCalls++;
+            return { block: true, reason: `command blocked by policy (denyBashPattern): ${command}` };
+          }
+        }
+        return undefined;
+      },
     });
 
     // Accumulate usage and bound turns. The watchdog/Stop button and the
@@ -361,6 +433,7 @@ export class PiAgentRunner implements AgentRunner {
         durationMs: Date.now() - started,
         turns,
         abortedForLimit,
+        blockedToolCalls,
         cancelled,
         timedOut,
         // shape understood by observability/events.ts normalizeUsage()

