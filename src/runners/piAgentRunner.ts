@@ -9,7 +9,15 @@ import type {
 import { redactAndTruncate } from "../engine/redaction.js";
 
 import { Agent } from "@earendil-works/pi-agent-core";
-import type { AgentEvent, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { AgentEvent, AgentMessage, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
+import {
+  convertToLlm,
+  createCompactionSummaryMessage,
+  estimateContextTokens,
+  estimateTokens,
+  generateSummary,
+  shouldCompact,
+} from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { ExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import {
@@ -119,6 +127,107 @@ const SafetySchema = z
   .strict()
   .default({ confineToCwd: true });
 
+/**
+ * Context-compaction policy for the inner loop. Long agent runs accumulate big
+ * tool transcripts that can exceed the model's context window; when triggered,
+ * the older middle of the transcript is summarized (via pi's `generateSummary`)
+ * and replaced with a single summary message, keeping the initial prompt and a
+ * recent tail. Off by default per call only in the sense that it never fires
+ * until the context is actually large.
+ */
+const CompactionOptionsSchema = z
+  .object({
+    /** enable automatic compaction decisions */
+    enabled: z.boolean().default(true),
+    /**
+     * Force compaction once the estimated context exceeds this many tokens.
+     * When unset, pi's `shouldCompact` decides against the model's context
+     * window (this knob mainly exists for deterministic testing/tuning).
+     */
+    thresholdTokens: z.number().int().positive().optional(),
+    /** approximate recent-context tokens to keep after compaction */
+    keepRecentTokens: z.number().int().positive().default(4_000),
+    /** tokens reserved for the summary prompt + output */
+    reserveTokens: z.number().int().positive().default(2_000),
+  })
+  .strict()
+  .default({ enabled: true });
+
+export type CompactionOptions = z.infer<typeof CompactionOptionsSchema>;
+
+/**
+ * Chooses where to cut the transcript for compaction: walk back from the end
+ * accumulating recent tokens until `keepRecentTokens` is met, then snap BACK to
+ * the assistant message that starts that turn, so the retained tail begins at a
+ * turn boundary (never a dangling toolResult whose tool call was summarized
+ * away). Returns the index where the retained tail begins (>= 1, keeping the
+ * initial prompt at messages[0]).
+ */
+export function findCompactionCut(messages: AgentMessage[], keepRecentTokens: number): number {
+  let acc = 0;
+  let cut = messages.length;
+  for (let i = messages.length - 1; i >= 1; i--) {
+    acc += estimateTokens(messages[i] as AgentMessage);
+    cut = i;
+    if (acc >= keepRecentTokens) break;
+  }
+  while (cut > 1 && (messages[cut] as AgentMessage).role !== "assistant") cut--;
+  return cut;
+}
+
+/**
+ * Builds an Agent `transformContext` that compacts the transcript when it grows
+ * past the configured budget, using pi's message-level summarization. Best
+ * effort: any failure (or nothing safe to summarize) returns the messages
+ * unchanged, so compaction can never break a run. Exported for direct testing.
+ */
+export function createCompactionTransform(
+  opts: CompactionOptions,
+  model: Model<any>,
+  apiKey: string | undefined,
+  thinkingLevel: PiAgentRunnerOptions["thinkingLevel"] = "off",
+): ((messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>) | undefined {
+  if (!opts.enabled) return undefined;
+  const settings = {
+    enabled: true,
+    reserveTokens: opts.reserveTokens,
+    keepRecentTokens: opts.keepRecentTokens,
+  };
+  return async (messages, signal) => {
+    // Need at least: prompt + one full assistant/toolResult turn + something to keep.
+    if (messages.length < 4) return messages;
+
+    const est = estimateContextTokens(messages);
+    const trigger =
+      opts.thresholdTokens !== undefined
+        ? est.tokens > opts.thresholdTokens
+        : shouldCompact(est.tokens, model.contextWindow, settings);
+    if (!trigger) return messages;
+
+    const cut = findCompactionCut(messages, opts.keepRecentTokens);
+    // Keep messages[0] (the task prompt); summarize the middle; keep the tail.
+    if (cut <= 1 || cut >= messages.length) return messages; // nothing safe to drop
+
+    const toSummarize = messages.slice(1, cut);
+    const tail = messages.slice(cut);
+    const result = await generateSummary(
+      toSummarize,
+      model,
+      opts.reserveTokens,
+      apiKey ?? "",
+      undefined,
+      signal,
+      undefined,
+      undefined,
+      thinkingLevel,
+    );
+    if (!result.ok) return messages; // best effort: keep full context on failure
+
+    const summary = createCompactionSummaryMessage(result.value, est.tokens, new Date().toISOString());
+    return [messages[0] as AgentMessage, summary, ...tail];
+  };
+}
+
 export const PiAgentRunnerOptionsSchema = z
   .object({
     /** provider id for pi-ai model resolution, e.g. "anthropic", "openai", "google" */
@@ -135,6 +244,8 @@ export const PiAgentRunnerOptionsSchema = z
     tools: z.array(z.enum(PI_AGENT_TOOL_NAMES)).optional(),
     /** tool-call permission policy (path confinement + bash denylist) */
     safety: SafetySchema,
+    /** context compaction policy for long inner loops */
+    compaction: CompactionOptionsSchema,
     /** rolling cap on the captured final answer text */
     maxOutputChars: z.number().int().positive().default(2_000_000),
   })
@@ -338,6 +449,16 @@ export class PiAgentRunner implements AgentRunner {
 
     const apiKey = this.apiKey();
 
+    // Context compaction (pi transformContext): summarize the older transcript
+    // when the inner loop grows past budget. When enabled we also adopt pi's
+    // convertToLlm so the inserted compactionSummary message renders correctly.
+    const transformContext = createCompactionTransform(
+      this.opts.compaction,
+      model,
+      apiKey,
+      this.opts.thinkingLevel,
+    );
+
     // Permission gate (pi's beforeToolCall hook): confine file tools to the
     // worktree and apply the optional bash denylist. A blocked call becomes an
     // error tool result the model sees and can recover from.
@@ -354,6 +475,7 @@ export class PiAgentRunner implements AgentRunner {
         tools: this.buildTools(env),
       },
       ...(this.deps.streamFn ? { streamFn: this.deps.streamFn } : {}),
+      ...(transformContext ? { transformContext, convertToLlm } : {}),
       getApiKey: () => apiKey,
       beforeToolCall: async ({ toolCall, args }) => {
         const name = (toolCall as { name: string }).name as PiAgentToolName;
@@ -382,6 +504,7 @@ export class PiAgentRunner implements AgentRunner {
     let abortedForLimit = false;
     const usage = { input: 0, output: 0, total: 0 };
     let lastQuotaText = "";
+    const emit = req.onEvent;
     const unsubscribe = agent.subscribe((event: AgentEvent) => {
       if (event.type === "turn_start") {
         if (turns >= this.opts.maxTurns) {
@@ -390,6 +513,22 @@ export class PiAgentRunner implements AgentRunner {
           return;
         }
         turns++;
+        emit?.({ phase: "turn_start", turn: turns, at: new Date().toISOString() });
+      } else if (event.type === "tool_execution_start") {
+        emit?.({
+          phase: "tool_start",
+          toolName: event.toolName,
+          toolCallId: event.toolCallId,
+          at: new Date().toISOString(),
+        });
+      } else if (event.type === "tool_execution_end") {
+        emit?.({
+          phase: "tool_end",
+          toolName: event.toolName,
+          toolCallId: event.toolCallId,
+          isError: event.isError,
+          at: new Date().toISOString(),
+        });
       } else if (event.type === "message_end" && event.message.role === "assistant") {
         const m = event.message as AssistantMessage;
         usage.input += m.usage?.input ?? 0;
@@ -401,6 +540,15 @@ export class PiAgentRunner implements AgentRunner {
 
     let cancelled = false;
     let timedOut = false;
+    let steerCount = 0;
+    // Steering: hand the caller a `steer(text)` bound to this live loop. A
+    // nudge is queued and injected after the current turn (pi's steering
+    // semantics), so a human/supervisor can redirect a long run without
+    // cancelling it.
+    req.steering?.((text: string) => {
+      steerCount++;
+      agent.steer({ role: "user", content: text, timestamp: Date.now() });
+    });
     const onAbort = (): void => {
       cancelled = true;
       agent.abort();
@@ -448,6 +596,7 @@ export class PiAgentRunner implements AgentRunner {
         turns,
         abortedForLimit,
         blockedToolCalls,
+        steerCount,
         cancelled,
         timedOut,
         // shape understood by observability/events.ts normalizeUsage()
