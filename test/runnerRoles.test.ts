@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { RunnerActor, RunnerCritic, RunnerRoleError } from "../src/adapters/runnerRoles.js";
 import { MockRunner } from "../src/runners/mockRunner.js";
-import type { RunnerProfile, RunResult } from "../src/runners/agentRunner.js";
+import type { AgentRunner, RunnerProfile, RunRequest, RunResult } from "../src/runners/agentRunner.js";
+import type { RunnerActivityEvent } from "../src/observability/events.js";
 import type { TaskSpec } from "../src/schemas/plan.js";
 import type { TaskArtifactBundle } from "../src/schemas/artifact.js";
 import { loadConfig } from "../src/config.js";
@@ -217,5 +218,66 @@ describe("runner-backed roles drive the real loop", () => {
     expect(outcome.finalState).toBe("GREEN");
     expect(outcome.reviewCycles).toBe(1);
     expect(outcome.buildAttempts).toBe(2);
+  });
+});
+
+
+describe("runner activity streaming (sub-step events)", () => {
+  const ts = () => new Date().toISOString();
+
+  it("forwards actor runner activity enriched with the role + runner identity", async () => {
+    const runner: AgentRunner = {
+      profile,
+      async run(req: RunRequest): Promise<RunResult> {
+        req.onEvent?.({ phase: "turn_start", turn: 1, at: ts() });
+        req.onEvent?.({ phase: "tool_start", toolName: "edit_file", toolCallId: "c1", at: ts() });
+        req.onEvent?.({ phase: "tool_end", toolName: "edit_file", toolCallId: "c1", isError: false, at: ts() });
+        return { text: buildJson("t1") };
+      },
+    };
+    const events: RunnerActivityEvent[] = [];
+    const actor = new RunnerActor(runner, { onActivity: (e) => events.push(e) });
+
+    await actor.build(sampleTask, undefined, ".");
+
+    expect(events.map((e) => e.phase)).toEqual(["turn_start", "tool_start", "tool_end"]);
+    expect(events.every((e) => e.role === "actor")).toBe(true);
+    expect(events.every((e) => e.runnerId === "p" && e.model === "test-model")).toBe(true);
+    const end = events.find((e) => e.phase === "tool_end");
+    expect(end?.toolName).toBe("edit_file");
+    expect(end?.toolCallId).toBe("c1");
+    expect(end?.isError).toBe(false);
+  });
+
+  it("attributes critic runner activity to the critic role", async () => {
+    const runner: AgentRunner = {
+      profile,
+      async run(req: RunRequest): Promise<RunResult> {
+        req.onEvent?.({ phase: "tool_start", toolName: "read_file", toolCallId: "x", at: ts() });
+        return { text: criticGreen().text };
+      },
+    };
+    const events: RunnerActivityEvent[] = [];
+    const critic = new RunnerCritic(runner, { onActivity: (e) => events.push(e) });
+
+    await critic.review({ kind: "task", bundle: sampleBundle });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.role).toBe("critic");
+    expect(events[0]?.toolName).toBe("read_file");
+  });
+
+  it("does no work and forwards nothing when no activity sink is configured", async () => {
+    let called = false;
+    const runner: AgentRunner = {
+      profile,
+      async run(req: RunRequest): Promise<RunResult> {
+        if (req.onEvent) called = true; // role must not pass an onEvent when sink is off
+        return { text: buildJson("t1") };
+      },
+    };
+    const actor = new RunnerActor(runner);
+    await actor.build(sampleTask, undefined, ".");
+    expect(called).toBe(false);
   });
 });

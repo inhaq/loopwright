@@ -5,6 +5,7 @@ import type { Actor, Critic } from "./agents.js";
 import { RunnerActor, RunnerCritic } from "./runnerRoles.js";
 import type { ActorPromptTemplates, CriticPromptTemplates } from "./prompts.js";
 import { instrumentRunner, type RunnerCallSink } from "../observability/instrument.js";
+import type { RunnerActivityEvent } from "../observability/events.js";
 
 /**
  * Configuration -> roles wiring (Task 13.3).
@@ -38,6 +39,8 @@ export interface CreateRolesOptions {
   log?: (line: string) => void;
   /** when set, every runner call emits an event attributed to its role (M5) */
   onRunnerCall?: RunnerCallSink;
+  /** when set, mid-call runner activity (tool calls) streams to this sink */
+  onActivity?: (e: RunnerActivityEvent) => void;
   /** cooperative cancellation, threaded into the actor/critic runner calls */
   signal?: AbortSignal;
 }
@@ -99,6 +102,7 @@ export function createRoles(
     ...(opts.cwd ? { cwd: opts.cwd } : {}),
     ...(opts.log ? { log: opts.log } : {}),
     ...(opts.signal ? { signal: opts.signal } : {}),
+    ...(opts.onActivity ? { onActivity: opts.onActivity } : {}),
   });
 
   const critic = new RunnerCritic(instrumentedCritic, {
@@ -106,6 +110,7 @@ export function createRoles(
     ...(opts.cwd ? { cwd: opts.cwd } : {}),
     ...(opts.log ? { log: opts.log } : {}),
     ...(opts.signal ? { signal: opts.signal } : {}),
+    ...(opts.onActivity ? { onActivity: opts.onActivity } : {}),
   });
 
   return { actor, critic };

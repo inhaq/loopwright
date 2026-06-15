@@ -56,6 +56,40 @@ export interface RunRequest {
    * long model call returns promptly instead of waiting for the runner timeout.
    */
   signal?: AbortSignal;
+  /**
+   * Optional sink for mid-call activity (sub-step streaming). Backends that run
+   * an inner agentic loop (e.g. the native agent runner) emit a {@link RunnerActivity}
+   * as the model calls tools, so the engine can surface live progress instead of
+   * a single opaque result. Single-shot backends (CLI/HTTP) simply ignore it.
+   */
+  onEvent?: (activity: RunnerActivity) => void;
+  /**
+   * Optional steering registration. Called once at the start of a run with a
+   * `steer(text)` function bound to the live inner loop; the caller (a human
+   * "nudge", a supervisor) may invoke it at any time while the run is in flight
+   * to inject guidance that takes effect after the current turn. Backends with
+   * no inner loop ignore it.
+   */
+  steering?: (steer: (text: string) => void) => void;
+}
+
+/**
+ * A mid-call progress signal from a runner's inner loop. Vendor-neutral and
+ * role-agnostic: the runner reports WHAT happened (a tool started/finished, a
+ * turn began); the role layer enriches it with the role/runner identity before
+ * it reaches the event stream.
+ */
+export interface RunnerActivity {
+  phase: "turn_start" | "tool_start" | "tool_end";
+  /** present for tool_start/tool_end */
+  toolName?: string;
+  /** correlates a tool_start with its tool_end */
+  toolCallId?: string;
+  /** present on tool_end: whether the tool reported an error */
+  isError?: boolean;
+  /** 1-based turn number, present on turn_start */
+  turn?: number;
+  at: string;
 }
 
 export interface RunResult {

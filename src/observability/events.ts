@@ -32,10 +32,29 @@ export interface RunnerCallEvent {
   at: string;
 }
 
+/**
+ * A mid-call activity signal from a runner's inner agentic loop (sub-step
+ * streaming), attributed to the role and runner that produced it. Emitted as
+ * the model calls tools so a monitor can show live progress within a single
+ * runner call, rather than waiting for the final result.
+ */
+export interface RunnerActivityEvent {
+  role: RoleName;
+  runnerId: string;
+  model: string;
+  phase: "turn_start" | "tool_start" | "tool_end";
+  toolName?: string;
+  toolCallId?: string;
+  isError?: boolean;
+  turn?: number;
+  at: string;
+}
+
 export const EVENT_TYPES = {
   sessionStarted: "session_started",
   planReviewed: "plan_reviewed",
   runnerCall: "runner_call",
+  runnerActivity: "runner_activity",
   sessionFinished: "session_finished",
   integration: "integration",
   publish: "publish",
