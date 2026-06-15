@@ -13,6 +13,7 @@ import { integrate, type IntegrationResult } from "./engine/integrator.js";
 import { publish, type PublishResult, type PrCreator } from "./engine/publisher.js";
 import { GitWorktreeManager } from "./workspace/worktrees.js";
 import type { GitExec } from "./workspace/git.js";
+import { worktreeDiff } from "./workspace/git.js";
 import type { IntegrationBranch } from "./engine/integrator.js";
 import type { CommandExecutor } from "./engine/mechanicalGate.js";
 import type { Store, SessionStatus } from "./storage/store.js";
@@ -210,6 +211,10 @@ export async function runGoal(
     const schedulerExtra: Partial<SchedulerDeps> = {};
     if (wt) {
       schedulerExtra.workspaceFor = async (t) => (await wt.acquire(t.id)).path;
+      // Review the real worktree diff (ground truth) rather than the actor's
+      // self-reported diff — the changes on disk are what gets committed and
+      // integrated, so they are what the critic should judge.
+      schedulerExtra.captureDiff = (taskCwd) => worktreeDiff(taskCwd, gitExec);
       schedulerExtra.onTaskSettled = async (t, r) => {
         const unblocking =
           r.outcome?.finalState === "GREEN" || r.outcome?.finalState === "UNVERIFIED_BY_CRITIC";

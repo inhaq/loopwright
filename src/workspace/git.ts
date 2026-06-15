@@ -116,3 +116,32 @@ export async function commitCount(
     return 0;
   }
 }
+
+/**
+ * Returns the unified diff of everything currently changed in the working tree
+ * at `dir`, relative to HEAD, INCLUDING newly created (untracked) files.
+ *
+ * This is the engine's ground-truth view of what an actor actually did: a
+ * file-editing runner edits the worktree on disk, and this is the artifact that
+ * later gets committed and integrated. The critic should review THIS, not the
+ * model's self-reported diff (which can diverge from disk).
+ *
+ * Untracked files are surfaced via `add -A --intent-to-add`, which writes only
+ * empty index entries so the new paths appear in `git diff`; the commit path's
+ * later `git add -A` overwrites them with real content, so this is safe to call
+ * mid-loop. Never throws: any git failure (unborn branch, git missing) degrades
+ * to an empty string so the caller can fall back to the model-reported diff.
+ */
+export async function worktreeDiff(dir: string, exec: GitExec = spawnGit): Promise<string> {
+  try {
+    // Intent-to-add so brand-new files show up as additions in the diff.
+    await exec(["add", "-A", "--intent-to-add"], dir);
+    const res = await exec(["diff", "HEAD"], dir);
+    if (res.exitCode === 0) return res.stdout;
+    // Unborn branch (no HEAD yet) or similar: diff against the index instead.
+    const fallback = await exec(["diff"], dir);
+    return fallback.exitCode === 0 ? fallback.stdout : "";
+  } catch {
+    return "";
+  }
+}
