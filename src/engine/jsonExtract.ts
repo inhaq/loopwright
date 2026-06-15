@@ -123,6 +123,11 @@ export function repairJson(json: string): string {
           index += 5;
           continue;
         }
+        // Invalid \u escape (not followed by exactly four hex digits): keep it
+        // literal by doubling the backslash so JSON.parse doesn't choke on it.
+        repaired += "\\\\u";
+        index += 1;
+        continue;
       }
       if (VALID_JSON_ESCAPES.has(nextChar)) {
         repaired += `\\${nextChar}`;
