@@ -76,6 +76,19 @@ export const PI_AGENT_TOOL_NAMES = [
 ] as const;
 export type PiAgentToolName = (typeof PI_AGENT_TOOL_NAMES)[number];
 
+/**
+ * Tools enabled when a profile doesn't specify an explicit allowlist. `bash`
+ * is intentionally excluded: arbitrary shell execution by default materially
+ * widens the prompt-injection / exfiltration surface, so it must be opted into
+ * explicitly via the `tools` option.
+ */
+const DEFAULT_PI_AGENT_TOOL_NAMES: readonly PiAgentToolName[] = [
+  "read_file",
+  "list_dir",
+  "write_file",
+  "edit_file",
+] as const;
+
 const ThinkingLevelSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 /** Tools whose first concern is a filesystem `path` argument. */
@@ -227,7 +240,7 @@ export const PiAgentRunnerOptionsSchema = z
     maxTurns: z.number().int().positive().default(60),
     /** overall wall-clock budget before the run is aborted */
     timeoutMs: z.number().int().positive().default(10 * 60_000),
-    /** restrict the toolset; defaults to all of {@link PI_AGENT_TOOL_NAMES} */
+    /** restrict the toolset; defaults to the file tools (bash is opt-in) */
     tools: z.array(z.enum(PI_AGENT_TOOL_NAMES)).optional(),
     /** tool-call permission policy (path confinement + bash denylist) */
     safety: SafetySchema,
@@ -300,7 +313,7 @@ export class PiAgentRunner implements AgentRunner {
 
   /** Builds the allowlisted toolset bound to one execution env. */
   private buildTools(env: ExecutionEnv): AgentTool[] {
-    const enabled = new Set<PiAgentToolName>(this.opts.tools ?? PI_AGENT_TOOL_NAMES);
+    const enabled = new Set<PiAgentToolName>(this.opts.tools ?? DEFAULT_PI_AGENT_TOOL_NAMES);
     const all: AgentTool[] = [
       defineTool({
         name: "read_file",
@@ -494,12 +507,13 @@ export class PiAgentRunner implements AgentRunner {
     const emit = req.onEvent;
     const unsubscribe = agent.subscribe((event: AgentEvent) => {
       if (event.type === "turn_start") {
-        turns++;
-        emit?.({ phase: "turn_start", turn: turns, at: new Date().toISOString() });
-        if (turns > this.opts.maxTurns) {
+        if (turns >= this.opts.maxTurns) {
           abortedForLimit = true;
           agent.abort();
+          return;
         }
+        turns++;
+        emit?.({ phase: "turn_start", turn: turns, at: new Date().toISOString() });
       } else if (event.type === "tool_execution_start") {
         emit?.({
           phase: "tool_start",
