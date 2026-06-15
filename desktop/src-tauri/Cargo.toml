@@ -19,9 +19,11 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
-# Used directly for the sidecar-startup read timeout (tauri's async runtime is
-# tokio, but a transitive dep is not usable directly).
-tokio = { version = "1", features = ["time"] }
+# Used directly for the sidecar-startup read timeout and for the oneshot
+# channel that bridges the non-blocking folder picker's callback back to the
+# async `pick_directory` command (tauri's async runtime is tokio, but a
+# transitive dep is not usable directly).
+tokio = { version = "1", features = ["time", "sync"] }
 
 [features]
 # default to a production build without devtools

@@ -1,112 +1,106 @@
 /**
- * Run settings + the model catalog.
+ * Run settings + the runner-preset catalog.
  *
  * The engine itself is vendor-neutral: a run is configured purely by env vars
  * (LOOPWRIGHT_RUNNERS + role bindings + publishing flags) plus an optional
  * repo path. This module is the UI-side source of truth that turns a friendly
- * "which model writes / which model reviews" choice into those env vars, and
+ * "which preset writes / which preset reviews" choice into those env vars, and
  * remembers every run-shaping preference between runs so the New run screen can
  * stay a minimal goal box while nothing is lost.
  *
- * HTTP models are grouped by the *environment key* (API key env var) that
- * unlocks them; CLI agents (Codex, Kiro) are grouped by the local command that
- * must be installed. CLI actors are the ones that actually edit files on disk —
- * HTTP runners only return a diff the engine does not apply.
+ * The catalog is a small, opinionated set of first-class RUNNER PRESETS rather
+ * than a generic provider/model matrix:
+ *
+ *   - codex-cli        `codex exec --json --model <model>` — a local CLI agent
+ *                      that edits files; best with a ChatGPT/Codex entitlement
+ *                      or an OpenAI key.
+ *   - openai-responses the OpenAI Responses API (`/v1/responses`) for a model
+ *                      id like gpt-5.5 — returns a diff, does not edit files.
+ *   - kiro-cli         `kiro-cli chat --no-interactive --trust-tools=…` with
+ *                      KIRO_API_KEY — a local CLI agent that edits files.
+ *
+ * CLI presets are the ones that actually edit files on disk; the Responses
+ * preset only returns a diff the engine does not apply.
  */
 
-export type ProviderKind = "http" | "cli" | "agent";
+/** Wire format each preset maps to (matches the engine's RunnerProfile.kind). */
+export type PresetKind = "cli" | "http-responses" | "agent";
 
-export interface CatalogModel {
-  /** model id sent to the provider (the runner profile's `model`) */
+export interface RunnerPreset {
+  /** stable preset id, e.g. "codex-cli" */
   id: string;
-  /** human label shown in the UI */
+  /** display name */
   label: string;
-}
+  kind: PresetKind;
+  /** one-line description shown under the picker */
+  description: string;
+  /** default model id (the run uses this unless the user overrides it) */
+  defaultModel: string;
+  /** whether the user can edit the model id (false for account-driven CLIs) */
+  configurableModel: boolean;
+  /** true for presets that edit files directly (can produce real changes) */
+  editsFiles: boolean;
+  /** how this preset authenticates, shown in the UI */
+  authHint: string;
 
-export interface Provider {
-  /** stable provider id, e.g. "openai" or "codex" */
-  id: string;
-  /** display name, e.g. "OpenAI" */
-  label: string;
-  kind: ProviderKind;
-  /** http: OpenAI-compatible base URL the HttpRunner targets */
+  /** http-responses: base URL the ResponsesRunner targets */
   baseUrl?: string;
-  /** http: env var name that holds this provider's API key */
+  /** http-responses: request path (default "/responses") */
+  path?: string;
+  /** http-responses: env var holding the API key (also used for auth status) */
   apiKeyEnv?: string;
+
   /** cli: the command that must be on PATH (used for install detection) */
   command?: string;
+  /** an env var the preset needs to authenticate (used for auth status) */
+  requiresEnv?: string;
   /**
    * agent: the pi-ai provider id used to resolve the model (e.g. "anthropic").
-   * Agent providers run a real in-process tool-calling loop and edit files.
+   * Agent presets run a real in-process tool-calling loop and edit files.
    */
   agentProvider?: string;
-  /** true for actors that edit files directly (CLI agents and native agents) */
-  editsFiles?: boolean;
-  /** models this provider offers */
-  models: CatalogModel[];
 }
 
 /**
- * Real providers and models. HTTP providers are keyed by the environment
- * variable that holds the API key; CLI providers are local file-editing agents.
- * No placeholder/demo entries: every option here is something a user can
- * actually run once the matching key is stored or the command is installed.
+ * The three first-class presets. Every entry is something a user can actually
+ * run once the matching key is stored and/or the command is installed.
  */
-export const MODEL_CATALOG: Provider[] = [
+export const PRESETS: RunnerPreset[] = [
   {
-    id: "openai",
-    label: "OpenAI",
-    kind: "http",
-    baseUrl: "https://api.openai.com/v1",
-    apiKeyEnv: "OPENAI_API_KEY",
-    models: [
-      { id: "gpt-4o", label: "GPT-4o" },
-      { id: "gpt-4o-mini", label: "GPT-4o mini" },
-      { id: "gpt-4.1", label: "GPT-4.1" },
-      { id: "gpt-4.1-mini", label: "GPT-4.1 mini" },
-      { id: "o3", label: "o3" },
-      { id: "o4-mini", label: "o4-mini" },
-    ],
-  },
-  {
-    id: "anthropic",
-    label: "Anthropic",
-    kind: "http",
-    baseUrl: "https://api.anthropic.com/v1",
-    apiKeyEnv: "ANTHROPIC_API_KEY",
-    models: [
-      { id: "claude-3-7-sonnet-latest", label: "Claude 3.7 Sonnet" },
-      { id: "claude-3-5-sonnet-latest", label: "Claude 3.5 Sonnet" },
-      { id: "claude-3-5-haiku-latest", label: "Claude 3.5 Haiku" },
-    ],
-  },
-  {
-    id: "google",
-    label: "Google",
-    kind: "http",
-    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
-    apiKeyEnv: "GEMINI_API_KEY",
-    models: [
-      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-      { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
-    ],
-  },
-  {
-    id: "codex",
+    id: "codex-cli",
     label: "Codex CLI",
     kind: "cli",
-    command: "codex",
+    description: "Runs `codex exec --json --model <model>` locally and edits files directly.",
+    defaultModel: "gpt-5.5",
+    configurableModel: true,
     editsFiles: true,
-    models: [{ id: "codex", label: "Codex (edits files)" }],
+    authHint: "Sign in with `codex login` (ChatGPT Business / Codex) or set OPENAI_API_KEY.",
+    command: "codex",
   },
   {
-    id: "kiro",
+    id: "openai-responses",
+    label: "OpenAI Responses API",
+    kind: "http-responses",
+    description: "Calls the OpenAI Responses API (/v1/responses). Returns a diff; does not edit files.",
+    defaultModel: "gpt-5.5",
+    configurableModel: true,
+    editsFiles: false,
+    authHint: "Needs OPENAI_API_KEY stored under Secrets.",
+    baseUrl: "https://api.openai.com/v1",
+    path: "/responses",
+    apiKeyEnv: "OPENAI_API_KEY",
+  },
+  {
+    id: "kiro-cli",
     label: "Kiro CLI",
     kind: "cli",
-    command: "kiro",
+    description: "Runs `kiro-cli chat --no-interactive` headlessly and edits files directly.",
+    defaultModel: "",
+    configurableModel: false,
     editsFiles: true,
-    models: [{ id: "kiro", label: "Kiro (edits files)" }],
+    authHint: "Needs the kiro-cli command installed and KIRO_API_KEY stored under Secrets.",
+    command: "kiro-cli",
+    requiresEnv: "KIRO_API_KEY",
   },
   // Native agent runners: a real in-process tool-calling loop (pi agent-core +
   // ai) that edits files directly. Grouped by the same API key as the matching
@@ -115,55 +109,59 @@ export const MODEL_CATALOG: Provider[] = [
     id: "anthropic-agent",
     label: "Anthropic (agent)",
     kind: "agent",
-    agentProvider: "anthropic",
-    apiKeyEnv: "ANTHROPIC_API_KEY",
+    description: "Runs a native in-process agent (pi agent-core + ai) on Anthropic models and edits files directly.",
+    defaultModel: "claude-3-7-sonnet-20250219",
+    configurableModel: true,
     editsFiles: true,
-    models: [
-      { id: "claude-3-7-sonnet-20250219", label: "Claude 3.7 Sonnet (edits files)" },
-      { id: "claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet (edits files)" },
-      { id: "claude-3-5-haiku-latest", label: "Claude 3.5 Haiku (edits files)" },
-    ],
+    authHint: "Needs ANTHROPIC_API_KEY stored under Secrets.",
+    apiKeyEnv: "ANTHROPIC_API_KEY",
+    agentProvider: "anthropic",
   },
   {
     id: "openai-agent",
     label: "OpenAI (agent)",
     kind: "agent",
-    agentProvider: "openai",
-    apiKeyEnv: "OPENAI_API_KEY",
+    description: "Runs a native in-process agent (pi agent-core + ai) on OpenAI models and edits files directly.",
+    defaultModel: "gpt-4.1",
+    configurableModel: true,
     editsFiles: true,
-    models: [
-      { id: "gpt-4.1", label: "GPT-4.1 (edits files)" },
-      { id: "gpt-4o", label: "GPT-4o (edits files)" },
-      { id: "o4-mini", label: "o4-mini (edits files)" },
-    ],
+    authHint: "Needs OPENAI_API_KEY stored under Secrets.",
+    apiKeyEnv: "OPENAI_API_KEY",
+    agentProvider: "openai",
   },
   {
     id: "google-agent",
     label: "Google (agent)",
     kind: "agent",
-    agentProvider: "google",
-    apiKeyEnv: "GEMINI_API_KEY",
+    description: "Runs a native in-process agent (pi agent-core + ai) on Google Gemini models and edits files directly.",
+    defaultModel: "gemini-2.5-pro",
+    configurableModel: true,
     editsFiles: true,
-    models: [
-      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro (edits files)" },
-      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash (edits files)" },
-    ],
+    authHint: "Needs GEMINI_API_KEY stored under Secrets.",
+    apiKeyEnv: "GEMINI_API_KEY",
+    agentProvider: "google",
   },
 ];
 
-/** A concrete model choice: which provider + which model id. */
+/** A concrete preset choice: which preset + (for configurable presets) model id. */
 export interface ModelChoice {
-  provider: string;
+  preset: string;
   model: string;
 }
 
 export interface RunSettings {
   /** absolute path of the local git repo the run builds against ("" = engine cwd) */
   repo: string;
-  /** model that writes the code (actor role) */
+  /** preset that writes the code (actor role) */
   writer: ModelChoice;
-  /** model that reviews the code (critic role) */
+  /** preset that reviews the code (critic role) */
   reviewer: ModelChoice;
+
+  /**
+   * Tools kiro-cli is trusted with in headless mode (`--trust-tools=<value>`).
+   * Empty falls back to `--trust-all-tools`. Only used by the kiro-cli preset.
+   */
+  kiroTrustTools: string;
 
   /** how many tasks run at once */
   maxParallel: number;
@@ -203,15 +201,16 @@ export interface RunSettings {
   advancedCritic: string;
 }
 
-const STORAGE_KEY = "loopwright.runSettings.v1";
-
-/** First provider that has at least one model — the baseline for defaults. */
-const firstProvider = MODEL_CATALOG[0]!;
+const STORAGE_KEY = "loopwright.runSettings.v2";
+/** Prior storage key; read once on upgrade so saved prefs aren't lost. */
+const LEGACY_STORAGE_KEY = "loopwright.runSettings.v1";
 
 export const DEFAULT_SETTINGS: RunSettings = {
   repo: "",
-  writer: { provider: firstProvider.id, model: "gpt-4o-mini" },
-  reviewer: { provider: firstProvider.id, model: "gpt-4o" },
+  // Writer edits files -> a CLI preset. Reviewer just reads -> Responses is fine.
+  writer: { preset: "codex-cli", model: "gpt-5.5" },
+  reviewer: { preset: "openai-responses", model: "gpt-5.5" },
+  kiroTrustTools: "fs_read,fs_write,execute_bash",
   maxParallel: 2,
   worktrees: true,
   mechanicalGate: true,
@@ -230,26 +229,31 @@ export const DEFAULT_SETTINGS: RunSettings = {
   advancedCritic: "",
 };
 
-export function getProvider(id: string): Provider | undefined {
-  return MODEL_CATALOG.find((p) => p.id === id);
+export function getPreset(id: string): RunnerPreset | undefined {
+  return PRESETS.find((p) => p.id === id);
 }
 
-export function findModel(choice: ModelChoice): { provider: Provider; model: CatalogModel } | undefined {
-  const provider = getProvider(choice.provider);
-  if (!provider) return undefined;
-  const model = provider.models.find((m) => m.id === choice.model);
-  if (!model) return undefined;
-  return { provider, model };
-}
-
-/** True when the choice resolves to a CLI agent that edits files on disk. */
+/** True when the choice resolves to a CLI preset that edits files on disk. */
 export function editsFiles(choice: ModelChoice): boolean {
-  return getProvider(choice.provider)?.editsFiles === true;
+  return getPreset(choice.preset)?.editsFiles === true;
 }
 
-/** Just the model label, e.g. "GPT-4o mini" (falls back to the raw id). */
+/**
+ * A short, human label for a choice: the model id for presets with a
+ * configurable model (e.g. "gpt-5.5"), otherwise the preset label.
+ */
 export function modelLabel(choice: ModelChoice): string {
-  return findModel(choice)?.model.label ?? choice.model ?? "—";
+  const preset = getPreset(choice.preset);
+  if (!preset) return choice.model || "—";
+  if (preset.configurableModel) return (choice.model || preset.defaultModel) || preset.label;
+  return preset.label;
+}
+
+/** The effective model id a choice will run with (falls back to the default). */
+export function effectiveModel(choice: ModelChoice): string {
+  const preset = getPreset(choice.preset);
+  if (!preset) return choice.model;
+  return preset.configurableModel ? (choice.model || preset.defaultModel) : preset.defaultModel;
 }
 
 /** True when an advanced runner-profile override is active. */
@@ -257,24 +261,46 @@ export function usesAdvancedRunners(settings: RunSettings): boolean {
   return settings.advancedRunners.trim() !== "";
 }
 
+/** Normalizes a possibly-legacy/partial choice into a valid preset choice. */
+function coerceChoice(value: unknown, fallback: ModelChoice): ModelChoice {
+  if (value === null || typeof value !== "object") return { ...fallback };
+  const v = value as Record<string, unknown>;
+  // Tolerate the legacy { provider, model } shape by mapping provider->preset.
+  const presetId = typeof v.preset === "string" ? v.preset : typeof v.provider === "string" ? v.provider : "";
+  const preset = getPreset(presetId);
+  if (!preset) return { ...fallback };
+  const model = typeof v.model === "string" ? v.model : "";
+  return { preset: preset.id, model };
+}
+
 /** Loads saved settings, falling back to defaults and tolerating bad/legacy data. */
 export function loadSettings(): RunSettings {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    let raw = localStorage.getItem(STORAGE_KEY);
+    // Upgrade path: if there's no v2 payload yet, migrate the v1 one so a user's
+    // repo / publishing / run preferences survive. The provider->preset mapping
+    // happens in coerceChoice; everything else carries over by key. The migrated
+    // result is resaved under the v2 key below so this only runs once.
+    let migrating = false;
+    if (!raw) {
+      const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (legacy) {
+        raw = legacy;
+        migrating = true;
+      }
+    }
     if (!raw) return { ...DEFAULT_SETTINGS };
-    const parsed = JSON.parse(raw) as Partial<RunSettings>;
+    const parsed = JSON.parse(raw) as Partial<RunSettings> & Record<string, unknown>;
     const merged: RunSettings = {
       ...DEFAULT_SETTINGS,
       ...parsed,
-      writer: { ...DEFAULT_SETTINGS.writer, ...(parsed.writer ?? {}) },
-      reviewer: { ...DEFAULT_SETTINGS.reviewer, ...(parsed.reviewer ?? {}) },
+      writer: coerceChoice(parsed.writer, DEFAULT_SETTINGS.writer),
+      reviewer: coerceChoice(parsed.reviewer, DEFAULT_SETTINGS.reviewer),
     };
-    // Coerce persisted scalars: tampered or legacy localStorage could hold the
-    // wrong type (e.g. maxParallel "abc", worktrees null), which would otherwise
-    // flow into buildRunEnv() and fail run startup with invalid config.
     const str = (v: unknown, d: string): string => (typeof v === "string" ? v : d);
     const bool = (v: unknown, d: boolean): boolean => (typeof v === "boolean" ? v : d);
     merged.repo = str(merged.repo, DEFAULT_SETTINGS.repo);
+    merged.kiroTrustTools = str(merged.kiroTrustTools, DEFAULT_SETTINGS.kiroTrustTools);
     merged.maxParallel =
       Number.isFinite(merged.maxParallel) && merged.maxParallel >= 1
         ? Math.floor(merged.maxParallel)
@@ -294,10 +320,9 @@ export function loadSettings(): RunSettings {
     merged.advancedRunners = str(merged.advancedRunners, DEFAULT_SETTINGS.advancedRunners);
     merged.advancedActor = str(merged.advancedActor, DEFAULT_SETTINGS.advancedActor);
     merged.advancedCritic = str(merged.advancedCritic, DEFAULT_SETTINGS.advancedCritic);
-    // Drop selections that no longer exist in the catalog so the UI never shows
-    // a stale/removed model as active.
-    if (!findModel(merged.writer)) merged.writer = { ...DEFAULT_SETTINGS.writer };
-    if (!findModel(merged.reviewer)) merged.reviewer = { ...DEFAULT_SETTINGS.reviewer };
+    // Persist the migrated payload under the new key so the legacy read only
+    // ever happens once.
+    if (migrating) saveSettings(merged);
     return merged;
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -315,51 +340,72 @@ export function saveSettings(settings: RunSettings): void {
 /** A runner profile as accepted by LOOPWRIGHT_RUNNERS. */
 interface RunnerProfile {
   id: string;
-  kind: ProviderKind;
+  kind: "cli" | "http-responses" | "agent";
   model: string;
   options: Record<string, unknown>;
 }
 
-function profileFor(id: string, choice: ModelChoice): RunnerProfile {
-  const provider = getProvider(choice.provider) ?? firstProvider;
-  if (provider.kind === "agent") {
+function profileFor(settings: RunSettings, id: string, choice: ModelChoice): RunnerProfile {
+  const preset = getPreset(choice.preset) ?? getPreset(DEFAULT_SETTINGS.writer.preset)!;
+
+  // Native in-process agent: a real tool-calling loop that edits files. The
+  // engine resolves the model via the pi-ai provider id; the API key env is
+  // forwarded so the runner can authenticate.
+  if (preset.kind === "agent") {
     return {
       id,
       kind: "agent",
-      model: choice.model,
+      model: effectiveModel(choice),
       options: {
-        provider: provider.agentProvider ?? provider.id,
-        ...(provider.apiKeyEnv ? { apiKeyEnv: provider.apiKeyEnv } : {}),
+        provider: preset.agentProvider ?? preset.id,
+        ...(preset.apiKeyEnv ? { apiKeyEnv: preset.apiKeyEnv } : {}),
       },
     };
   }
-  if (provider.kind === "cli") {
-    if (provider.id === "kiro") {
-      return {
-        id,
-        kind: "cli",
-        model: "",
-        options: { command: "kiro", args: ["--headless", "--prompt", "{{prompt}}"], promptVia: "arg", output: { mode: "last-line" } },
-      };
-    }
-    // Codex (default CLI shape)
+
+  if (preset.id === "kiro-cli") {
+    const trust = settings.kiroTrustTools.trim();
+    const trustArg = trust ? `--trust-tools=${trust}` : "--trust-all-tools";
     return {
       id,
       kind: "cli",
       model: "",
       options: {
+        command: "kiro-cli",
+        args: ["chat", "--no-interactive", trustArg, "{{prompt}}"],
+        promptVia: "arg",
+        // Headless Kiro prints the assistant's answer to stdout; the engine's
+        // JSON extraction tolerates surrounding log lines for structured calls.
+        output: { mode: "stdout" },
+      },
+    };
+  }
+
+  if (preset.kind === "cli") {
+    // codex-cli
+    return {
+      id,
+      kind: "cli",
+      model: effectiveModel(choice),
+      options: {
         command: "codex",
-        args: ["exec", "--json", "{{prompt}}"],
+        args: ["exec", "--json", "--model", "{{model}}", "{{prompt}}"],
         promptVia: "arg",
         output: { mode: "json-stream", textPath: "msg.text", typeField: "type", type: "item.completed" },
       },
     };
   }
+
+  // openai-responses
   return {
     id,
-    kind: "http",
-    model: choice.model,
-    options: { baseUrl: provider.baseUrl, apiKeyEnv: provider.apiKeyEnv },
+    kind: "http-responses",
+    model: effectiveModel(choice),
+    options: {
+      baseUrl: preset.baseUrl,
+      path: preset.path ?? "/responses",
+      apiKeyEnv: preset.apiKeyEnv,
+    },
   };
 }
 
@@ -380,7 +426,10 @@ export function buildRunEnv(settings: RunSettings): Record<string, string> {
     actor = settings.advancedActor.trim();
     critic = settings.advancedCritic.trim();
   } else {
-    runnersJson = JSON.stringify([profileFor("writer", settings.writer), profileFor("reviewer", settings.reviewer)]);
+    runnersJson = JSON.stringify([
+      profileFor(settings, "writer", settings.writer),
+      profileFor(settings, "reviewer", settings.reviewer),
+    ]);
     actor = "writer";
     critic = "reviewer";
   }

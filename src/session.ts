@@ -13,6 +13,7 @@ import { integrate, type IntegrationResult } from "./engine/integrator.js";
 import { publish, type PublishResult, type PrCreator } from "./engine/publisher.js";
 import { GitWorktreeManager } from "./workspace/worktrees.js";
 import type { GitExec } from "./workspace/git.js";
+import { worktreeDiff } from "./workspace/git.js";
 import type { IntegrationBranch } from "./engine/integrator.js";
 import type { CommandExecutor } from "./engine/mechanicalGate.js";
 import type { Store, SessionStatus } from "./storage/store.js";
@@ -141,26 +142,42 @@ export async function runGoal(
     // (Task 22). When persisting, calls are recorded to the store's event stream.
     const onRunnerCall: RunnerCallSink | undefined =
       store && sessionId
-        ? (e) =>
-            store.recordEvent({
-              sessionId,
-              at: e.at,
-              type: EVENT_TYPES.runnerCall,
-              data: e as unknown as Record<string, unknown>,
-            })
+        ? (e) => {
+            void store
+              .recordEvent({
+                sessionId,
+                at: e.at,
+                type: EVENT_TYPES.runnerCall,
+                data: e as unknown as Record<string, unknown>,
+              })
+              .catch((err) => {
+                opts.log?.(
+                  `failed to persist runner_call: ${String((err as Error)?.message ?? err)}`,
+                );
+              });
+          }
         : roleOpts.onRunnerCall;
     // Mid-call runner activity (sub-step streaming): tool calls from a native
     // agent runner's inner loop flow to the same event stream, so the monitor
     // (and the durable trace) see live progress within a single runner call.
     const onActivity: ((e: RunnerActivityEvent) => void) | undefined =
       store && sessionId
-        ? (e) =>
-            store.recordEvent({
-              sessionId,
-              at: e.at,
-              type: EVENT_TYPES.runnerActivity,
-              data: e as unknown as Record<string, unknown>,
-            })
+        ? (e) => {
+            // Fire-and-forget persistence: never let a rejected recordEvent
+            // surface as an unhandled rejection and destabilize the run.
+            void store
+              .recordEvent({
+                sessionId,
+                at: e.at,
+                type: EVENT_TYPES.runnerActivity,
+                data: e as unknown as Record<string, unknown>,
+              })
+              .catch((err) => {
+                opts.log?.(
+                  `failed to persist runner_activity: ${String((err as Error)?.message ?? err)}`,
+                );
+              });
+          }
         : roleOpts.onActivity;
     const { actor, critic } = createRoles(config, {
       ...roleOpts,
@@ -225,6 +242,10 @@ export async function runGoal(
     const schedulerExtra: Partial<SchedulerDeps> = {};
     if (wt) {
       schedulerExtra.workspaceFor = async (t) => (await wt.acquire(t.id)).path;
+      // Review the real worktree diff (ground truth) rather than the actor's
+      // self-reported diff — the changes on disk are what gets committed and
+      // integrated, so they are what the critic should judge.
+      schedulerExtra.captureDiff = (taskCwd) => worktreeDiff(taskCwd, gitExec);
       schedulerExtra.onTaskSettled = async (t, r) => {
         const unblocking =
           r.outcome?.finalState === "GREEN" || r.outcome?.finalState === "UNVERIFIED_BY_CRITIC";

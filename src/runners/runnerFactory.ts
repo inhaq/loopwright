@@ -1,6 +1,7 @@
 import type { AgentRunner, RunnerProfile } from "./agentRunner.js";
 import { CliRunner } from "./cliRunner.js";
 import { HttpRunner } from "./httpRunner.js";
+import { ResponsesRunner } from "./responsesRunner.js";
 import { MockRunner } from "./mockRunner.js";
 import { PiAgentRunner } from "./piAgentRunner.js";
 
@@ -31,6 +32,8 @@ export const createRunner: RunnerFactory = (profile) => {
       return MockRunner.fromProfile(profile);
     case "http":
       return new HttpRunner(profile);
+    case "http-responses":
+      return new ResponsesRunner(profile);
     case "agent":
       return new PiAgentRunner(profile);
     default: {

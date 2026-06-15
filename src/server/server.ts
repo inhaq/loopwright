@@ -60,6 +60,30 @@ export type RunGoalImpl = (
   opts?: RunGoalOptions,
 ) => Promise<SessionResult>;
 
+/** Outcome of submitting a run programmatically (HTTP route or relay). */
+export type SubmitResult =
+  | { ok: true; sessionId: string }
+  | { ok: false; status: number; error: string };
+
+/** Info passed to a notifier when a run reaches a terminal state. */
+export interface RunFinishedInfo {
+  sessionId: string;
+  goal: string;
+  phase: "done" | "error";
+  result?: SessionResult;
+  error?: string;
+}
+
+/**
+ * Optional sink for terminal run status (e.g. the Telegram relay). It is
+ * deliberately outbound-only and best-effort: the server never lets a notifier
+ * error affect a run, and a notifier is the ONLY way run status leaves the
+ * loopback boundary.
+ */
+export interface ServerNotifier {
+  runFinished(info: RunFinishedInfo): void;
+}
+
 export interface CreateServerOptions {
   /** durable store shared by runs (writes) and the trace endpoint (reads) */
   store: Store;
@@ -96,6 +120,12 @@ export interface CreateServerOptions {
    * force-closing any that remain (idle keep-alive sockets, slow clients).
    */
   shutdownGraceMs?: number;
+  /**
+   * Optional outbound notifier for terminal run status (e.g. a Telegram relay).
+   * The server keeps no inbound exposure; this is the only channel by which run
+   * status leaves the process.
+   */
+  notifier?: ServerNotifier;
 }
 
 export interface LoopwrightServer {
@@ -107,6 +137,13 @@ export interface LoopwrightServer {
   /** listen on a port (0 = ephemeral) and resolve with the bound port */
   start(port?: number, host?: string): Promise<number>;
   stop(): Promise<void>;
+  /**
+   * Starts a run programmatically (same path as POST /api/runs), without going
+   * through HTTP. Used by the Telegram relay to launch chat-initiated runs.
+   */
+  submitRun(body: StartRunBody): Promise<SubmitResult>;
+  /** Env + repo of the most recent run, for chat-initiated runs to reuse. */
+  lastRunConfig(): { env: Record<string, string>; repoDir?: string } | undefined;
 }
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
@@ -210,8 +247,11 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
   const retainMs = opts.retainMs ?? 5 * 60_000;
   const onShutdown = opts.onShutdown;
   const shutdownGraceMs = opts.shutdownGraceMs ?? 3_000;
+  const notifier = opts.notifier;
   const hub = new RunHub(opts.maxBufferPerRun);
   let activeRuns = 0;
+  /** env + repo of the most recent run, reused for chat-initiated runs */
+  let lastRun: { env: Record<string, string>; repoDir?: string } | undefined;
   /** abort controllers for in-flight runs, keyed by session id (for cancel) */
   const controllers = new Map<string, AbortController>();
   /**
@@ -382,8 +422,23 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     } catch (err) {
       return send(res, 400, { error: `invalid JSON body: ${String((err as Error).message)}` }, cors);
     }
+    const result = await submitRun(body);
+    if (!result.ok) return send(res, result.status, { error: result.error }, cors);
+    return send(res, 202, { sessionId: result.sessionId }, cors);
+  }
+
+  /**
+   * Core run-start logic, shared by the HTTP route and programmatic callers
+   * (the Telegram relay). Validates the request and kicks the run off in the
+   * background, returning a structured result instead of writing to a response.
+   * The fire-and-forget run streams progress over the hub and, on completion,
+   * notifies any configured outbound notifier.
+   */
+  async function submitRun(body: StartRunBody): Promise<SubmitResult> {
+    if (closing) return { ok: false, status: 503, error: "server is shutting down" };
+
     const goal = (body.goal ?? "").trim();
-    if (!goal) return send(res, 400, { error: "goal is required" }, cors);
+    if (!goal) return { ok: false, status: 400, error: "goal is required" };
 
     // Resolve per-run config from the merged env, but never let a caller
     // redirect persistence away from the server's store.
@@ -393,61 +448,50 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     try {
       runConfig = loadConfig(mergedEnv);
     } catch (err) {
-      return send(res, 400, { error: `invalid config: ${String((err as Error).message)}` }, cors);
+      return { ok: false, status: 400, error: `invalid config: ${String((err as Error).message)}` };
     }
     runConfig.dbPath = config.dbPath;
 
     // Effective repo: the per-run body value wins, falling back to the env
-    // default. The body is untyped JSON, so reject a non-string up front (a
-    // number would otherwise throw on .trim() and turn a bad request into a
-    // 500). It must be an absolute path (the field is documented as such, and a
-    // relative path would resolve against the server's cwd, not the caller's),
-    // and it must be a git working tree — validate before the run so it fails
-    // with a clear 400 rather than deep inside worktree setup.
+    // default. The body is untyped JSON, so reject a non-string up front. It
+    // must be an absolute path and a git working tree — validated before the
+    // run so it fails clearly rather than deep inside worktree setup.
     if (body.repoDir !== undefined && typeof body.repoDir !== "string") {
-      return send(res, 400, { error: "repoDir must be a string" }, cors);
+      return { ok: false, status: 400, error: "repoDir must be a string" };
     }
     const repoDir =
       (typeof body.repoDir === "string" ? body.repoDir.trim() : "") || runConfig.repoDir.trim();
     if (repoDir) {
       if (!path.isAbsolute(repoDir)) {
-        return send(res, 400, { error: `repoDir must be an absolute path (got "${repoDir}")` }, cors);
+        return { ok: false, status: 400, error: `repoDir must be an absolute path (got "${repoDir}")` };
       }
       if (!(await isGitRepo(repoDir))) {
-        return send(
-          res,
-          400,
-          { error: `repoDir "${repoDir}" is not a git repository (run git init or pick another folder)` },
-          cors,
-        );
+        return {
+          ok: false,
+          status: 400,
+          error: `repoDir "${repoDir}" is not a git repository (run git init or pick another folder)`,
+        };
       }
     }
 
     // A caller-supplied session id becomes part of git branch names and
-    // worktree paths, so reject anything outside the bounded safe format before
-    // it reaches the filesystem/git. New runs without an id get a safe UUID.
+    // worktree paths, so reject anything outside the bounded safe format.
     if (body.sessionId !== undefined && !isValidSessionId(body.sessionId)) {
-      return send(
-        res,
-        400,
-        { error: "sessionId must match /^[A-Za-z0-9_-]{1,64}$/" },
-        cors,
-      );
+      return { ok: false, status: 400, error: "sessionId must match /^[A-Za-z0-9_-]{1,64}$/" };
     }
     const sessionId = body.sessionId ?? randomUUID();
     if (hub.has(sessionId) && hub.phase(sessionId) === "running") {
-      return send(res, 409, { error: `session ${sessionId} is already running` }, cors);
+      return { ok: false, status: 409, error: `session ${sessionId} is already running` };
     }
     // Admission control: cap concurrent background runs so repeated clicks, a
     // buggy UI, or a leaked token can't kick off unbounded expensive work.
     if (activeRuns >= maxActiveRuns) {
-      return send(
-        res,
-        429,
-        { error: `too many active runs (max ${maxActiveRuns}); wait for one to finish` },
-        cors,
-      );
+      return { ok: false, status: 429, error: `too many active runs (max ${maxActiveRuns}); wait for one to finish` };
     }
+
+    // Remember this run's shaping so chat-initiated runs (Telegram) can reuse
+    // the same presets + repo by supplying only a new goal.
+    lastRun = { env: { ...(body.env ?? {}) }, ...(repoDir ? { repoDir } : {}) };
 
     // Live wiring: the observer streams transitions/attempts/outcomes; the
     // tapping store streams lifecycle + runner-call events; `log` streams the
@@ -483,9 +527,9 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
 
     // Fire-and-forget: the run proceeds in the background and the client
     // follows it over SSE. Errors (including cancellation) surface as a terminal
-    // status message. The settle promise is tracked so a graceful shutdown can
-    // wait for an aborted run to finish persisting its failure and cleaning up
-    // its worktree.
+    // status message AND (best-effort) to the outbound notifier. The settle
+    // promise is tracked so a graceful shutdown can wait for an aborted run to
+    // finish persisting its failure and cleaning up its worktree.
     const run = runGoalImpl(goal, runConfig, {
       store: tappedStore,
       sessionId,
@@ -498,12 +542,12 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     })
       .then((result) => {
         hub.publish(sessionId, "status", { phase: "done", result } satisfies RunStatusData);
+        notifySafe({ sessionId, goal, phase: "done", result });
       })
       .catch((err: unknown) => {
-        hub.publish(sessionId, "status", {
-          phase: "error",
-          error: String((err as Error)?.message ?? err),
-        } satisfies RunStatusData);
+        const error = String((err as Error)?.message ?? err);
+        hub.publish(sessionId, "status", { phase: "error", error } satisfies RunStatusData);
+        notifySafe({ sessionId, goal, phase: "error", error });
       })
       .finally(() => {
         settle();
@@ -511,7 +555,17 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
       });
     activeRunPromises.add(run);
 
-    send(res, 202, { sessionId }, cors);
+    return { ok: true, sessionId };
+  }
+
+  /** Best-effort outbound notification; a notifier error never affects a run. */
+  function notifySafe(info: RunFinishedInfo): void {
+    if (!notifier) return;
+    try {
+      notifier.runFinished(info);
+    } catch {
+      /* never let a notification failure surface into the run */
+    }
   }
 
   function streamRun(
@@ -701,6 +755,12 @@ export function createServer(opts: CreateServerOptions): LoopwrightServer {
     },
     stop(): Promise<void> {
       return closeServer();
+    },
+    submitRun(body: StartRunBody): Promise<SubmitResult> {
+      return submitRun(body);
+    },
+    lastRunConfig(): { env: Record<string, string>; repoDir?: string } | undefined {
+      return lastRun;
     },
   };
 }

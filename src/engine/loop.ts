@@ -45,6 +45,15 @@ export interface LoopDeps {
    * config.stuckThresholdMs when set. <= 0 disables it. (Milestone 3, Task 18)
    */
   stuckThresholdMs?: number;
+  /**
+   * Optional ground-truth diff capture for the build working directory (the
+   * task's git worktree). When provided and it returns a non-empty diff, the
+   * engine reviews THAT instead of the actor's self-reported diff — so the
+   * artifact the critic sees is the artifact that actually gets integrated.
+   * Falls back to the model-reported diff when absent or empty (e.g. a runner
+   * that returns a diff but does not edit files on disk).
+   */
+  captureDiff?: (cwd: string) => Promise<string> | string;
   /** cancels the run cooperatively: checked between steps; kills gate commands */
   signal?: AbortSignal;
 }
@@ -274,6 +283,18 @@ export async function runTask(
         feedback = undefined;
         lastDiff = built.diff;
         lastTouched = built.touchedFiles;
+        // Prefer the real worktree diff (ground truth) over the model's
+        // self-reported diff when a capture seam is wired (worktree runs). This
+        // is read BEFORE the mechanical gate so build/test artifacts don't
+        // pollute the reviewed diff. Any failure falls back to the model diff.
+        if (deps.captureDiff) {
+          try {
+            const realDiff = await deps.captureDiff(deps.cwd);
+            if (realDiff.trim() !== "") lastDiff = realDiff;
+          } catch {
+            /* keep the model-reported diff */
+          }
+        }
         await deps.observer?.attempt?.({
           taskId: task.id,
           attempt: buildAttempts,
